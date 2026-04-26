@@ -11,8 +11,8 @@ from tqdm import tqdm
 
 
 BASE_DIR = 'data'
-TYPE1_DIR = os.path.join(BASE_DIR, 'type1')
-TYPE2_DIR = os.path.join(BASE_DIR, 'type2')
+TYPE1_DIR = os.path.join(BASE_DIR, 'type1_new')
+TYPE2_DIR = os.path.join(BASE_DIR, 'type2_new')
 
 MAX_WORKERS = 10
 
@@ -29,17 +29,17 @@ def get_targets_by_type():
     
     # Process Type 1
     try:
-        df1 = pd.read_csv('data/type1_candidates_low_z.csv')
+        df1 = pd.read_csv('data/type1_candidates_fixed.csv')
         # Dropping duplicates within the file itself
-        df1_unique = df1.drop_duplicates(subset=['PLATE', 'mjd', 'FIBER'])
+        df1_unique = df1.drop_duplicates(subset=['PLATE', 'mjd', 'fiber'])
         for _, row in df1_unique.iterrows():
-            type1_targets.append((int(row['PLATE']), int(row['mjd']), int(row['FIBER'])))
+            type1_targets.append((int(row['PLATE']), int(row['mjd']), int(row['fiber'])))
     except Exception as e:
         print(f"Error reading Type 1 file: {e}")
 
     # Process Type 2
     try:
-        df2 = pd.read_csv('data/type2_candidates.csv')
+        df2 = pd.read_csv('data/type2_candidates_fixed.csv')
         # Dropping duplicates within the file itself
         df2_unique = df2.drop_duplicates(subset=['PLATE', 'MJD_class_table', 'FIBERID_class_table'])
         for _, row in df2_unique.iterrows():
@@ -104,22 +104,49 @@ def main():
     # Download Type 2 into data/type2
     run_download_batch(t2_list, TYPE2_DIR, "Type 2")
 
-def merge_gal_catalog(class_path,info_path,SNR_threshold):
+def merge_gal_catalog(class_path, info_path, SNR_threshold=5):
     class_table = Table.read(class_path)
     info_table = Table.read(info_path)
-    combined_table = hstack([class_table,info_table],table_names = ['class_table','info_table'])
+    
+    combined_table = hstack([class_table, info_table], table_names=['class_table', 'info_table'])
 
     names_merged = [name for name in combined_table.colnames if len(combined_table[name].shape) <= 1]    
     merged_df = combined_table[names_merged].to_pandas()
 
-    df_filtered = merged_df[(merged_df['I_CLASS'] == 4) & (merged_df['SN_MEDIAN'] >=5)]
+    # Clean up the string columns 
+    # Astropy FITS tables load strings as byte arrays (e.g., b'GALAXY   '). 
+    # We must decode them so pandas can read them normally.
+    string_columns = ['SPECTROTYPE', 'SUBCLASS', 'TARGETTYPE']
+    for col in string_columns:
+        if col in merged_df.columns:
+            # Check if the first item is bytes
+            if isinstance(merged_df[col].dropna().iloc[0], bytes):
+                merged_df[col] = merged_df[col].str.decode('utf-8').str.strip()
+            else:
+                merged_df[col] = merged_df[col].str.strip()
 
+    # --- NEW: 2. Apply Strict SDSS & MPA-JHU Filtering ---
+    # Fill NaN values in SUBCLASS with an empty string so string matching doesn't crash
+    merged_df['SUBCLASS'] = merged_df['SUBCLASS'].fillna('')
+
+    mask = (
+        (merged_df['I_CLASS'] == 4) &                          # MPA-JHU confirms it is a BPT AGN
+        (merged_df['Z_WARNING'] == 0) &                        # SDSS Pipeline had ZERO extraction/fit errors
+        (merged_df['SN_MEDIAN'] >= SNR_threshold) &            # General spectrum quality check
+        (merged_df['SPECTROTYPE'] == 'GALAXY') &               # Ensure it wasn't misclassified as a STAR
+        (~merged_df['SUBCLASS'].str.contains('BROADLINE'))     # Explicitly reject Type 1 leaks in the Type 2 catalog
+    )
+
+    df_filtered = merged_df[mask].copy()
+
+    print(f"Filtered Type 2 Catalog: Retained {len(df_filtered)} highly confident candidates.")
+    
     return df_filtered
     
 
 
-def filter_SNR(df, c4_col, mg2_col, hb_col, ha_col, SNR_threshold):
-    cols = [c4_col, mg2_col, hb_col, ha_col]
+def filter_SNR(df, hb_col, ha_col, SNR_threshold):
+    cols = [hb_col, ha_col]
     
     # Condition: If a line is present (SNR > 0), it MUST be above the threshold.
     # We allow SNR <= 0 (meaning the line is not in the spectrum/not detected)
@@ -135,12 +162,58 @@ def filter_SNR(df, c4_col, mg2_col, hb_col, ha_col, SNR_threshold):
     df_filtered = df[mask & any_line_detected].copy()
     return df_filtered
 
+def extract_shen_type1_catalog(catalog_path, z_threshold=0.4, SNR_threshold=5.0):
+    """
+    Specifically tailored to filter the Shen 2011 DR7 Quasar Catalog (dr7_bh_Nov19_2013.fits).
+    """
+    print(f"Loading Shen 2011 Quasar Catalog from {catalog_path}...")
+    catalog = Table.read(catalog_path)
+    
+    # Filter multidimensional arrays
+    names = [name for name in catalog.colnames if len(catalog[name].shape) <= 1]
+    df = catalog[names].to_pandas()
 
+    # 1. Decode Byte Strings (SDSS_NAME)
+    if 'SDSS_NAME' in df.columns and isinstance(df['SDSS_NAME'].dropna().iloc[0], bytes):
+        df['SDSS_NAME'] = df['SDSS_NAME'].str.decode('utf-8').str.strip()
+
+    # 2. The Physics & Quality Filters
+    # SN_RATIO is the Shen catalog's median SNR per pixel
+    mask = ((df['BAL_FLAG'] == 0) & (df['REDSHIFT'] < z_threshold))
+    
+    df_filtered = df[mask].copy()
+
+
+    df_filtered = filter_SNR(
+        df_filtered, 
+        'LINE_MED_SN_HB', 
+        'LINE_MED_SN_HA', 
+        SNR_threshold
+    )
+
+    # 3. Construct the legacy SDSS filename (spSpec-MMMMM-PPPP-FFF.fit)
+    # Shen uses 'FIBERID', not 'FIBER'
+    df_filtered['filename'] = (
+        "spSpec-" + 
+        df_filtered['MJD'].astype(int).astype(str).str.zfill(5) + "-" + 
+        df_filtered['PLATE'].astype(int).astype(str).str.zfill(4) + "-" + 
+        df_filtered['FIBER'].astype(int).astype(str).str.zfill(3) + ".fit"
+    )
+
+    # 4. Standardize column names to match your pipeline
+    cols_to_keep = ['filename', 'SDSS_NAME', 'RA', 'DEC', 'REDSHIFT', 'MJD', 'PLATE', 'FIBER', 'LINE_MED_SN_HB']
+    df_final = df_filtered[cols_to_keep].rename(columns={
+        'REDSHIFT': 'z', 
+        'MJD': 'mjd', 
+        'FIBER': 'fiber',
+        'LINE_MED_SN_HB': 'snr'
+    })
+
+    print(f"Filtered Type 1 Catalog: Retained {len(df_final)} clean, low-z broad-line candidates.")
+    return df_final
 
 
 def find_candidates(catalog_input,**kwargs):
-
-
     z_threshold = kwargs.get('z_threshold',None)
     object_class = kwargs.get('object_class',None)
     SNR_threshold = kwargs.get('SNR_threshold',None)
@@ -201,26 +274,9 @@ if __name__ == "__main__":
     main()
     
     
+    #type1_candidates = extract_shen_type1_catalog('/Users/amir/Documents/Deep learning/cl-agn classifier/cataloges/dr7_bh_Nov19_2013.fits.gz', SNR_threshold=5)
+    #type1_candidates.to_csv('/Users/amir/Documents/Deep learning/cl-agn classifier/data/type1_candidates_fixed.csv', index=False)    
     
-    #type1_candidates = pd.read_csv('data/type1_candidates.csv')
+    #type1= pd.read_csv('/Users/amir/Documents/Deep learning/cl-agn classifier/data/type1_candidates_fixed.csv')
+    #type2= pd.read_csv('/Users/amir/Documents/Deep learning/cl-agn classifier/data/type2_candidates_fixed.csv')
 
-    #type2_candidates = pd.read_csv('data/type2_candidates.csv')
-
-
-    #max_2_redshift = np.max(type2_candidates['Z'])
-    #print(max_2_redshift)
-
-
-
-
-    #type1_candidates_low_z = (type1_candidates[type1_candidates['REDSHIFT'] <= 0.398])
-
-    #type1_candidates_low_z.to_csv('data/type1_candidates_low_z.csv')
-
-
-    #plt.hist(type2_candidates['Z'],color = 'blue',alpha = 0.3,density = True,label = 'Type2')
-    #plt.hist(type1_candidates['REDSHIFT'],color = 'red',alpha = 0.3,density=True, label = 'Type1')
-    #plt.legend()
-    #plt.title('Redshift Distribution of both cataloges')
-    #plt.show()
-    

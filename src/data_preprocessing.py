@@ -8,6 +8,59 @@ import os
 from scipy.interpolate import interp1d
 from joblib import Parallel, delayed
 import glob
+import argparse
+import torch
+import torch.nn.functional as F
+
+
+def morphological_continuum_subtraction(x, window_size=151, clip_max=4.0, taper_len=5):
+    """
+    Acts as a lightweight spectral decomposition by estimating and subtracting 
+    the continuum envelope using morphological pooling.
+    x: [Batch, 1, Sequence_Length]
+    """
+    # 1. Pad the sequence to handle edge artifacts smoothly
+    pad = window_size // 2
+    x_padded = F.pad(x, (pad, pad), mode='reflect')
+    
+    # 2. Extract the continuum envelope using a wide average pool
+    # This acts as a low-pass filter, ignoring sharp narrow lines and following the slope
+    continuum = F.avg_pool1d(x_padded, kernel_size=window_size, stride=1)
+    
+    # 3. Subtract the continuum from the original flux
+    x_flattened = x - continuum
+    
+    # 4. Standardize the result to ensure numeric stability for the CNN
+    mean = x_flattened.mean(dim=-1, keepdim=True)
+    std = x_flattened.std(dim=-1, keepdim=True)
+    x_normalized = (x_flattened - mean) / (std + 1e-8)
+    
+    # 5. DECAPITATE NARROW LINES (The Grad-CAM Fix)
+    # This prevents the network from using the [O III] / Narrow Balmer ratio to cheat
+    #x_clipped = torch.clamp(x_normalized, min=-10.0, max=clip_max)
+    
+    # 6. EDGE TAPERING (The Limits Fix)
+    # Surgically fade the first and last 5 pixels to destroy reflection artifacts
+    seq_len = x.shape[-1]
+    taper = torch.ones(seq_len, device=x.device)
+    
+    # Create a linear fade from 0 to 1
+    fade = torch.linspace(0, 1, taper_len, device=x.device)
+    
+    # Apply to left and right edges
+    taper[:taper_len] = fade
+    taper[-taper_len:] = torch.flip(fade, dims=[0])
+    
+    # Reshape so it broadcasts perfectly over (Batch, Channels, SeqLen)
+    taper = taper.view(1, 1, -1)
+    
+    # Apply the taper to the clipped tensor
+    x_final = x_normalized * taper
+
+    return x_final
+
+
+
 
 def standardize_flux(flux_array):
     """Standardizes a flux array by mean and standard deviation."""
@@ -108,12 +161,22 @@ def process_single_spectrum(file_path, agn_type, master_grid):
             f_interp = interp1d(wave_rest, flux_rest, bounds_error=False, fill_value=np.nan)
             interpolated_flux = f_interp(master_grid)
             
-            # 5. Standardize the interpolated flux
-            processed_flux = standardize_flux(interpolated_flux)
-        
-            # 6. Fill out-of-bounds areas with 0.0 (which is now exactly the mean)
-            processed_flux = np.nan_to_num(processed_flux, nan=0.0).astype(np.float32)
+            # 5. Handle NaNs in RAW space using the median (prevents the rolling average from crashing)
+            valid_median = np.nanmedian(interpolated_flux)
+            interpolated_flux = np.nan_to_num(interpolated_flux, nan=valid_median)
             
+            # 6. Convert to PyTorch Tensor and add Batch/Channel dimensions -> shape [1, 1, 1024]
+            tensor_flux = torch.tensor(interpolated_flux, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+            
+            # 7. Apply Morphological Continuum Subtraction 
+            # (This safely handles the subtraction, the standardization, the clipping, and the tapering all at once!)
+            processed_tensor = morphological_continuum_subtraction(
+                tensor_flux, window_size=151, taper_len=5, clip_max=4.0
+            )
+            
+            # 8. Squeeze it back down to a flat 1D NumPy array for your Parquet file
+            processed_flux = processed_tensor.squeeze().numpy()
+
             return {
                 "filename": os.path.basename(file_path), 
                 "obj_id": obj_id,
@@ -159,9 +222,17 @@ def build_agn_catalog(type1_path, type2_path, master_grid):
     return final_df
 
 
-def clean_dataset(df, max_zeros_pct=0.5, min_snr=5.0, max_flux_outlier=30.0):
+def clean_dataset(df, max_zeros_pct=0.5, min_snr=5.0, max_flux_outlier=30.0, max_neg_flux=5.0):
     """
-    Cleans the dataset by removing spectra with low coverage, poor SNR, or extreme outliers.
+    Cleans the dataset by removing spectra with low coverage, poor SNR,
+    extreme positive outliers, or extreme negative flux values.
+    
+    Parameters
+    ----------
+    max_neg_flux : float
+        After z-normalization, if any flux value in a spectrum is below
+        -max_neg_flux (i.e. has a negative dip larger than this threshold),
+        the entire spectrum is discarded.
     """
     meta_cols = ['filename', 'obj_id', 'agn_type', 'z', 'snr']
     flux_cols = [c for c in df.columns if c not in meta_cols]
@@ -171,39 +242,92 @@ def clean_dataset(df, max_zeros_pct=0.5, min_snr=5.0, max_flux_outlier=30.0):
     zeros_pct = (flux_mat == 0.0).mean(axis=1)
     valid_coverage = zeros_pct <= max_zeros_pct
     
-    # 2. Filter extreme outliers
+    # 2. Filter extreme positive outliers
     max_flux = flux_mat.max(axis=1)
     valid_outlier = max_flux <= max_flux_outlier
     
     # 3. Filter low SNR
     valid_snr = df['snr'] >= min_snr
     
+    # 4. Filter extreme negative flux after z-normalization
+    #    A spectrum is bad if min(flux) < -max_neg_flux
+    min_flux = flux_mat.min(axis=1)
+    valid_neg_flux = min_flux >= -max_neg_flux
+    
     # Combine masks
-    good_mask = valid_coverage & valid_outlier & valid_snr
+    good_mask = valid_coverage & valid_outlier & valid_snr & valid_neg_flux
     df_clean = df[good_mask].copy()
     
     print(f"Original spectra: {len(df)}")
-    print(f"Dropped due to coverage: {(~valid_coverage).sum()}")
-    print(f"Dropped due to outliers: {(~valid_outlier).sum()}")
-    print(f"Dropped due to low SNR:  {(~valid_snr).sum()}")
-    print(f"Remaining clean spectra: {len(df_clean)}")
+    print(f"Dropped due to coverage:       {(~valid_coverage).sum()}")
+    print(f"Dropped due to pos outliers:   {(~valid_outlier).sum()}")
+    print(f"Dropped due to low SNR:        {(~valid_snr).sum()}")
+    print(f"Dropped due to neg flux (<-{max_neg_flux}): {(~valid_neg_flux).sum()}")
+    print(f"Remaining clean spectra:       {len(df_clean)}")
     
     return df_clean
 
-# --- EXECUTION ---
-if __name__ == "__main__":
-    master_grid = np.linspace(4575,6699,1024) 
-
-    df = build_agn_catalog(
-        type1_path = "data/type1/", 
-        type2_path = "data/type2/",
-        master_grid = master_grid
-    )
+def run_preprocessing(mode='full', existing_parquet='data/processed_agn_catalog_cut.parquet',
+                      output='data/processed_agn_catalog_cut.parquet'):
+    """
+    Main preprocessing pipeline.
+    
+    Parameters
+    ----------
+    mode : str
+        'full'     - process original type1/ and type2/ directories.
+        'new_only' - process type1_new/ and type2_new/ only.
+        'merge'    - process new dirs and merge with existing parquet.
+    existing_parquet : str
+        Path to existing parquet file (used only in 'merge' mode).
+    output : str
+        Path to save the cleaned output parquet.
+    """
+    master_grid = np.linspace(4575, 6699, 1024)
+    
+    if mode == 'full':
+        print("=== Processing original type1/type2 directories ===")
+        df = build_agn_catalog(
+            type1_path="data/type1/",
+            type2_path="data/type2/",
+            master_grid=master_grid
+        )
+    elif mode == 'new_only':
+        print("=== Processing NEW type1_new/type2_new directories ===")
+        df = build_agn_catalog(
+            type1_path="data/type1_new/",
+            type2_path="data/type2_new/",
+            master_grid=master_grid
+        )
+    elif mode == 'merge':
+        print("=== Processing NEW data and merging with existing parquet ===")
+        df_new = build_agn_catalog(
+            type1_path="data/type1_new/",
+            type2_path="data/type2_new/",
+            master_grid=master_grid
+        )
+        print(f"\nNew spectra processed: {len(df_new)}")
+        
+        print(f"Loading existing parquet: {existing_parquet}")
+        df_existing = pd.read_parquet(existing_parquet)
+        print(f"Existing spectra: {len(df_existing)}")
+        
+        # Merge: drop duplicates based on filename to avoid re-adding existing spectra
+        df = pd.concat([df_existing, df_new], ignore_index=True)
+        df = df.drop_duplicates(subset='filename', keep='first')
+        print(f"Combined (deduplicated): {len(df)}")
+    else:
+        raise ValueError(f"Unknown mode '{mode}'. Choose from: 'full', 'new_only', 'merge'.")
     
     print("\nCleaning dataset...")
-    # HERE is where the dataset is cleaned!
-    df_clean = clean_dataset(df, max_zeros_pct=0.5, min_snr=5.0, max_flux_outlier=30.0)
+    df_clean = clean_dataset(df, max_zeros_pct=0.5, min_snr=5.0, 
+                             max_flux_outlier=30.0, max_neg_flux=5.0)
 
-    # Note: explicitly saving to data/ folder so it's easily found by the notebook
-    df_clean.to_parquet('data/processed_agn_catalog_cut.parquet') 
-    print(f'\nSaved cleaned df with {len(df_clean)} spectra to data/processed_agn_catalog_cut.parquet')
+    df_clean.to_parquet(output)
+    print(f'\nSaved cleaned df with {len(df_clean)} spectra to {output}')
+    return df_clean
+
+
+# --- EXECUTION ---
+if __name__ == "__main__":
+    run_preprocessing(mode='new_only', output='data/processed_agn_new.parquet')

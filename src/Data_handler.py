@@ -4,6 +4,11 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
+from utils import load_config
+import os
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 def get_spectrum_limits(df):
     meta_cols = ['filename', 'agn_type', 'z', 'snr', 'obj_id']
@@ -120,12 +125,22 @@ class AGNSpectraDataset(Dataset):
             for start_wave, end_wave in self.mask_ranges:
                 mask_idx = (self.wavelengths >= start_wave) & (self.wavelengths <= end_wave)
                 x[..., mask_idx] = 0.0
-               
+
         if self.apply_masking:
             seq_len = x.shape[-1]
-            mask_len = torch.randint(50, 201, (1,)).item()
-            start_idx = 0 if torch.rand(1).item() < 0.5 else seq_len - mask_len
-            x[..., start_idx:start_idx + mask_len] = 0.0
+            
+            # 1. TARGETED H-ALPHA DROPOUT (50% chance)
+            # Force the network to survive without the red edge crutch
+            if torch.rand(1).item() < 0.5:
+                x[..., -250:] = 0.0
+                
+            # 2. RANDOM SPECAUGMENT (The Whack-a-Mole Defense)
+            # Drop 1 or 2 smaller random masks to force continuum learning
+            num_masks = torch.randint(1, 3, (1,)).item()
+            for _ in range(num_masks):
+                mask_len = torch.randint(30, 100, (1,)).item()
+                start_idx = torch.randint(0, seq_len - mask_len, (1,)).item()
+                x[..., start_idx:start_idx + mask_len] = 0.0
 
         return x, y, z
 
@@ -134,7 +149,9 @@ def prepare_agn_data(df, batch_size=256, random_state=42, mask_lines=False):
     meta_cols = ['filename', 'agn_type', 'z', 'snr', 'obj_id']
     flux_cols = [c for c in df.columns if c not in meta_cols]
     wavelengths = np.array(flux_cols).astype(float)
-    
+    config = load_config(os.path.join(BASE_DIR, 'config.yml'))
+
+
     X = df[flux_cols].values
     X = np.expand_dims(X, axis=1) # (N, 1, 1024)
     y = (df['agn_type'] == 2).astype(int).values # Binary Targets
@@ -160,8 +177,8 @@ def prepare_agn_data(df, batch_size=256, random_state=42, mask_lines=False):
     pos_weight = torch.tensor([num_neg / num_pos], dtype=torch.float32)
 
     # --- NEW: Pass z to Datasets ---
-    train_ds = AGNSpectraDataset(X_train, y_train, z=z_train, wavelengths=wavelengths, apply_masking=True, mask_lines=mask_lines)
-    val_ds   = AGNSpectraDataset(X_val, y_val, z=z_val, wavelengths=wavelengths, apply_masking=False, mask_lines=False)
+    train_ds = AGNSpectraDataset(X_train, y_train, z=z_train, wavelengths=wavelengths, apply_masking=True, mask_lines=True)
+    val_ds   = AGNSpectraDataset(X_val, y_val, z=z_val, wavelengths=wavelengths, apply_masking=True, mask_lines=True)
     test_ds  = AGNSpectraDataset(X_test, y_test, z=z_test, wavelengths=wavelengths, apply_masking=False, mask_lines=False)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
@@ -169,3 +186,57 @@ def prepare_agn_data(df, batch_size=256, random_state=42, mask_lines=False):
     test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
     
     return train_loader, val_loader, test_loader, pos_weight
+
+
+class SyntheticSiameseDataset(Dataset):
+    def __init__(self, df, flux_cols, epoch_size=2000):
+        """
+        df: The pandas dataframe (df_clean)
+        flux_cols: List of the wavelength column names
+        epoch_size: Arbitrary number of pairs to generate per epoch
+        """
+        self.df = df
+        self.flux_cols = flux_cols
+        self.epoch_size = epoch_size
+        
+        # Pre-sort indices by class so we can sample them instantly
+        self.t1_indices = self.df[self.df['agn_type'] == 1].index.values
+        self.t2_indices = self.df[self.df['agn_type'] == 2].index.values
+
+    def __len__(self):
+        # Because we are generating pairs randomly, the concept of "dataset length" 
+        # is arbitrary. We set it to a fixed size per epoch.
+        return self.epoch_size
+
+    def get_spectrum(self, idx):
+        # Extract, convert to float32, and add the channel dimension [1, Seq_Len]
+        x = self.df.loc[idx, self.flux_cols].values.astype(np.float32)
+        return torch.tensor(x).unsqueeze(0) 
+
+    def __getitem__(self, i):
+        # 1. Flip a coin: 50% chance of Change (1) or Static (0)
+        target = np.random.randint(0, 2)
+        
+        if target == 1: 
+            # STATE CHANGE: Pick one random Type 1 and one random Type 2
+            idx1 = np.random.choice(self.t1_indices)
+            idx2 = np.random.choice(self.t2_indices)
+        else: 
+            # STATIC: 50% chance of T1+T1, 50% chance of T2+T2
+            if np.random.rand() > 0.5:
+                idx1 = np.random.choice(self.t1_indices)
+                idx2 = np.random.choice(self.t1_indices)
+            else:
+                idx1 = np.random.choice(self.t2_indices)
+                idx2 = np.random.choice(self.t2_indices)
+
+        x1 = self.get_spectrum(idx1)
+        x2 = self.get_spectrum(idx2)
+        
+        # 2. Randomly swap the chronological order
+        # We don't want the network memorizing that Type 1 is always 'x1'.
+        # A change is a change, regardless of direction.
+        if np.random.rand() > 0.5:
+            x1, x2 = x2, x1
+
+        return x1, x2, torch.tensor([target], dtype=torch.float32)

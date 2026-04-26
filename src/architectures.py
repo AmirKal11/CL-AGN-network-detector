@@ -195,6 +195,70 @@ class SpectraNet(nn.Module):
         redshift_output = self.redshift_head(reversed_flat)
         
         return class_output, redshift_output
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SiameseSpectraNet(nn.Module):
+    def __init__(self, pretrained_spectranet, freeze_backbone=True):
+        super().__init__()
+        
+        # 1. The Pretrained Backbone
+        self.feature_extractor = pretrained_spectranet.feature_extractor
+        self.transformer = pretrained_spectranet.global_corr
+        
+        # 2. Freeze the backbone to preserve the learned physics
+        if freeze_backbone:
+            for param in self.feature_extractor.parameters():
+                param.requires_grad = False
+            for param in self.transformer.parameters():
+                param.requires_grad = False
+                
+        # 3. The New Temporal Change Head
+        # Assuming the output of your global pooling is 512 dimensions.
+        # Concatenating T1 (512), T2 (512), and Absolute Difference (512) = 1536
+        self.temporal_head = nn.Sequential(
+            nn.Linear(1536, 512),
+            nn.GELU(),
+            nn.Dropout(0.5), # Heavy dropout to prevent co-adaptation on the fused vector
+            nn.Linear(512, 128),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 1) # Single logit for Binary Focal Loss
+        )
+
+    def forward_one_branch(self, x):
+        """Extracts the 1D embedding for a single epoch's spectrum."""
+        features = self.feature_extractor(x)
+        features = features.permute(0, 2, 1) 
+        
+        # Transformer Multi-Head Attention
+        attn_out, _ = self.transformer.mha(features, features, features)
+        
+        # Apply your Global Avg + Max Pooling (matching your base architecture)
+        avg_pool = torch.mean(attn_out, dim=1)
+        max_pool, _ = torch.max(attn_out, dim=1)
+        embedding_1d = torch.cat([avg_pool, max_pool], dim=1) # Shape: [Batch, 512]
+        
+        return embedding_1d
+
+    def forward(self, x_t1, x_t2):
+        """Processes both epochs and predicts if a change occurred."""
+        # 1. Extract embeddings
+        emb_t1 = self.forward_one_branch(x_t1)
+        emb_t2 = self.forward_one_branch(x_t2)
+        
+        # 2. Calculate the distance vector in latent space
+        abs_diff = torch.abs(emb_t1 - emb_t2)
+        
+        # 3. Fuse the temporal information
+        fused_features = torch.cat([emb_t1, emb_t2, abs_diff], dim=1)
+        
+        # 4. Predict
+        logits = self.temporal_head(fused_features)
+        return logits
  
 class BinaryFocalLossWithLogits(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):

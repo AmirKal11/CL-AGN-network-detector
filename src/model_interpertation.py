@@ -13,196 +13,334 @@ from architectures import SpectraNet
 import pandas as pd
 from Data_handler import prepare_for_nn
 
-def morphological_continuum_subtraction(x, window_size=151):
+class SignedType2GradCAM1D:
     """
-    Identical filter used in train.py to ensure the network sees the flattened data.
-    """
-    pad = window_size // 2
-    x_padded = F.pad(x, (pad, pad), mode='reflect')
-    continuum = F.avg_pool1d(x_padded, kernel_size=window_size, stride=1)
-    x_flattened = x - continuum
-    mean = x_flattened.mean(dim=-1, keepdim=True)
-    std = x_flattened.std(dim=-1, keepdim=True)
-    x_normalized = (x_flattened - mean) / (std + 1e-8)
-    return x_normalized
+    Signed Grad-CAM for a single-logit binary classifier.
 
+    Convention:
+        sigmoid(logit) = P(Type 2)
 
-class GradCAM:
+    IMPORTANT:
+    We ALWAYS backpropagate from the raw Type 2 logit.
+
+    Therefore:
+        positive CAM  -> evidence toward Type 2
+        negative CAM  -> evidence toward Type 1
+        |CAM|         -> importance magnitude
     """
-    Grad-CAM for 1D Convolutional Networks.
-    Highlights the regions of the 1D sequence that contributed most to the prediction.
-    """
+
     def __init__(self, model, target_layer):
         self.model = model
         self.target_layer = target_layer
         self.gradients = None
         self.activations = None
-        
-        # Register hooks
-        self.target_layer.register_forward_hook(self.save_activation)
-        self.target_layer.register_full_backward_hook(self.save_gradient)
-        
-    def save_activation(self, module, input, output):
+
+        self.forward_handle = self.target_layer.register_forward_hook(
+            self._save_activation
+        )
+        self.backward_handle = self.target_layer.register_full_backward_hook(
+            self._save_gradient
+        )
+
+    def _save_activation(self, module, inputs, output):
         self.activations = output
-        
-    def save_gradient(self, module, grad_input, grad_output):
+
+    def _save_gradient(self, module, grad_input, grad_output):
         self.gradients = grad_output[0]
-        
-    def __call__(self, x, target_class=1):
+
+    def remove_hooks(self):
+        self.forward_handle.remove()
+        self.backward_handle.remove()
+
+    def __call__(self, x):
         """
-        x: Input tensor of shape (1, 1, Sequence_Length)
-        target_class: 1 for Type 2, 0 for Type 1.
+        x: [1, 1, SeqLen]
+        Returns a signed CAM normalized to [-1, 1].
         """
         self.model.eval()
-        self.model.zero_grad()
-        
-        # FIX: Unpack the dual outputs from the new SpectraNet architecture
-        class_output, _ = self.model(x)
-        
-        pred_prob = torch.sigmoid(class_output).item()
-        
-        # For binary classification with a single logit:
-        # If target_class == 1, we want gradients that increase the logit.
-        # If target_class == 0, we want gradients that decrease the logit.
-        if target_class == 0:
-            loss = -class_output
-        else:
-            loss = class_output
-            
-        # Backward pass to get gradients
-        loss.backward(retain_graph=True)
-        
-        # Calculate Grad-CAM
-        # Global average pool the gradients across the sequence dimension
-        weights = torch.mean(self.gradients, dim=2, keepdim=True) # (1, Channels, 1)
-        
-        # Weighted combination of activations
-        cam = torch.sum(weights * self.activations, dim=1, keepdim=True) # (1, 1, L)
-        
-        # Apply ReLU to keep only features that have a positive influence
-        cam = F.relu(cam)
-        
-        # Normalize between 0 and 1
-        cam = cam - torch.min(cam)
-        cam = cam / (torch.max(cam) + 1e-8)
-        
-        # Interpolate back to original sequence length (1024)
-        # MPS doesn't support 1D linear interpolation, so we do it on CPU!
-        cam = cam.cpu()
-        cam = F.interpolate(cam, size=x.shape[2], mode='linear', align_corners=False)
-        
-        return cam.detach().squeeze().numpy(), pred_prob
+        self.model.zero_grad(set_to_none=True)
 
-def plot_combined_gradcam(results, wavelengths, filename="gradcam_combined.png"):
+        class_logit, _ = self.model(x)
+        class_logit = class_logit.squeeze()
+
+        pred_prob_type2 = torch.sigmoid(class_logit).item()
+        pred_class = 1 if pred_prob_type2 >= 0.5 else 0
+
+        # Uniform convention for ALL samples:
+        # backprop from the Type 2 logit
+        class_logit.backward(retain_graph=False)
+
+        if self.gradients is None or self.activations is None:
+            raise RuntimeError(
+                "Gradients/activations were not captured. "
+                "Check the target layer."
+            )
+
+        # Global-average-pool gradients over sequence dimension
+        weights = self.gradients.mean(dim=2, keepdim=True)   # [1, C, 1]
+
+        # Weighted combination of activations
+        cam = torch.sum(weights * self.activations, dim=1, keepdim=True)  # [1, 1, L]
+
+        # Upsample to input length
+        cam = cam.detach().cpu()
+        cam = F.interpolate(
+            cam,
+            size=x.shape[-1],
+            mode='linear',
+            align_corners=False
+        )
+
+        cam = cam.squeeze().numpy()
+
+        # Signed normalization: preserve sign
+        max_abs = np.max(np.abs(cam)) + 1e-8
+        cam = cam / max_abs
+
+        return {
+            "cam": cam,
+            "pred_prob_type2": pred_prob_type2,
+            "pred_class": pred_class
+        }
+
+
+def get_flux_columns_and_wavelengths(df):
+    meta_cols = ['filename', 'agn_type', 'z', 'snr', 'obj_id']
+    flux_cols = [c for c in df.columns if c not in meta_cols]
+    wavelengths = np.array(flux_cols, dtype=float)
+    return flux_cols, wavelengths
+
+
+def collect_signed_cams_by_true_class(
+    df,
+    flux_cols,
+    device,
+    grad_cam,
+    n_per_class=50,
+    only_correct=True,
+    random_state=42
+):
     """
-    Plots multiple spectra and overlays the Grad-CAM heatmap in subplots.
+    Collect signed CAMs for true Type 1 and true Type 2 spectra.
+
+    Returns:
+        cams_by_class = {
+            0: [cam1, cam2, ...],  # true Type 1
+            1: [cam1, cam2, ...]   # true Type 2
+        }
     """
-    fig, axes = plt.subplots(len(results), 1, figsize=(14, 5 * len(results)), sharex=True)
-    if len(results) == 1:
-        axes = [axes]
-        
-    for i, res in enumerate(results):
-        ax = axes[i]
-        x_array = res['x_array']
-        cam = res['cam']
-        pred_prob = res['pred_prob']
-        actual_class = res['actual_class']
-        target_class = res['target_class']
-        
-        # Plot the original normalized flux
-        ax.plot(wavelengths, x_array, color='black', linewidth=1.2, label='Spectrum')
-        
-        # Create a colored heatmap over the spectrum
-        sc = ax.scatter(wavelengths, x_array, c=cam, cmap='jet', alpha=0.6, s=15, zorder=2)
-        
-        # Also add a colorbar to explain the colormap
-        cbar = fig.colorbar(sc, ax=ax, pad=0.02)
-        cbar.set_label('Grad-CAM Importance', rotation=270, labelpad=15)
-        
-        pred_label = "Type 2" if pred_prob >= 0.5 else "Type 1"
-        actual_label = "Type 2" if actual_class == 1 else "Type 1"
-        target_label = "Type 2" if target_class == 1 else "Type 1"
-        
-        title = (f"Grad-CAM (Target: {target_label}) | "
-                 f"Pred: {pred_label} (Prob: {pred_prob:.3f}) | Actual: {actual_label}")
-        
-        ax.set_title(title, fontsize=14, fontweight='bold')
-        ax.set_ylabel('Normalized Flux', fontsize=12)
-        ax.grid(True, linestyle='--', alpha=0.5)
-        ax.legend(loc='upper right')
-        
-    axes[-1].set_xlabel('Rest Wavelength (Å)', fontsize=12)
-    plt.tight_layout()
-    
-    plt.savefig(filename, dpi=300)
-    print(f"Saved combined Grad-CAM plot to {filename}")
+    cams_by_class = {0: [], 1: []}
+
+    df_shuffled = df.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
+
+    for _, row in df_shuffled.iterrows():
+        actual_class = 1 if row['agn_type'] == 2 else 0
+
+        if len(cams_by_class[actual_class]) >= n_per_class:
+            if len(cams_by_class[0]) >= n_per_class and len(cams_by_class[1]) >= n_per_class:
+                break
+            continue
+
+        x_array = row[flux_cols].values.astype(np.float32)
+        x_tensor = torch.tensor(x_array).view(1, 1, -1).to(device)
+
+        #x_processed = morphological_continuum_subtraction(x_tensor)
+
+        result = grad_cam(x_tensor)
+
+        if only_correct and result["pred_class"] != actual_class:
+            continue
+
+        cams_by_class[actual_class].append(result["cam"])
+
+    print(f"Collected {len(cams_by_class[0])} correct Type 1 CAMs")
+    print(f"Collected {len(cams_by_class[1])} correct Type 2 CAMs")
+
+    return cams_by_class
+
+
+def plot_signed_cam_subplots(
+    cams_by_class,
+    wavelengths,
+    filename=None,
+    title="Average Signed Grad-CAM by True Class"
+):
+    """
+    Two-panel plot:
+        Top    -> true Type 1 spectra
+        Bottom -> true Type 2 spectra
+
+    Uniform sign convention in BOTH panels:
+        positive -> evidence toward Type 2
+        negative -> evidence toward Type 1
+    """
+    fig, axes = plt.subplots(
+        2, 1,
+        figsize=(14, 9),
+        sharex=True,
+        sharey=True
+    )
+
+    class_names = {
+        0: "True Type 1 spectra",
+        1: "True Type 2 spectra"
+    }
+
+    spectral_lines = {
+        "Hβ": 4861,
+        "[O III]": 5007,
+        "Hα": 6563
+    }
+
+    all_means = []
+    all_stds = []
+
+    # First pass to compute shared y-limits
+    for class_id in [0, 1]:
+        cams = np.array(cams_by_class[class_id])
+        if len(cams) == 0:
+            all_means.append(None)
+            all_stds.append(None)
+            continue
+
+        mean_cam = cams.mean(axis=0)
+        std_cam = cams.std(axis=0)
+        all_means.append(mean_cam)
+        all_stds.append(std_cam)
+
+    # Shared y-limits
+    ymin, ymax = 1e9, -1e9
+    for mean_cam, std_cam in zip(all_means, all_stds):
+        if mean_cam is None:
+            continue
+        ymin = min(ymin, np.min(mean_cam - std_cam))
+        ymax = max(ymax, np.max(mean_cam + std_cam))
+
+    if ymin == 1e9:
+        ymin, ymax = -1.0, 1.0
+
+    pad = 0.08 * max(abs(ymin), abs(ymax), 1.0)
+    ymin -= pad
+    ymax += pad
+
+    for ax, class_id, mean_cam, std_cam in zip(axes, [0, 1], all_means, all_stds):
+        if mean_cam is None:
+            ax.set_title(f"{class_names[class_id]} (no samples)")
+            continue
+
+        ax.plot(
+            wavelengths,
+            mean_cam,
+            linewidth=2.2,
+            label=class_names[class_id]
+        )
+
+        ax.fill_between(
+            wavelengths,
+            mean_cam - std_cam,
+            mean_cam + std_cam,
+            alpha=0.2
+        )
+
+        ax.axhline(0, color='black', linestyle='-', linewidth=1.0, alpha=0.8)
+
+        for name, wave in spectral_lines.items():
+            ax.axvline(wave, color='steelblue', linestyle='--', alpha=0.6)
+            ax.text(
+                wave,
+                ymax * 0.92,
+                name,
+                rotation=90,
+                verticalalignment='top',
+                horizontalalignment='left',
+                color='black',
+                fontsize=11
+            )
+
+        ax.set_ylim(ymin, ymax)
+        ax.set_ylabel("Signed Grad-CAM")
+        ax.set_title(class_names[class_id], fontsize=13, fontweight='bold')
+        ax.grid(True, linestyle='--', alpha=0.35)
+        ax.legend(loc='best')
+
+    axes[-1].set_xlabel("Rest Wavelength (Å)")
+
+    fig.suptitle(title, fontsize=15, fontweight='bold', y=0.98)
+
+    # Helpful annotation with the uniform convention
+    fig.text(
+        0.5, 0.02,
+        "Positive values = evidence toward Type 2   |   Negative values = evidence toward Type 1",
+        ha='center',
+        fontsize=11
+    )
+
+    plt.tight_layout(rect=[0, 0.04, 1, 0.96])
+
+    if filename is not None:
+        plt.savefig(filename, dpi=300)
+        print(f"Saved subplot Grad-CAM figure to: {filename}")
+
     plt.show()
-def run_gradcam_analysis():
+
+
+def run_signed_gradcam_subplot_analysis(
+    n_per_class=50,
+    only_correct=True
+):
     config = load_config(os.path.join(BASE_DIR, 'config.yml'))
-    
-    # Setup Device
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+
+    device = torch.device(
+        "mps" if torch.backends.mps.is_available()
+        else "cuda" if torch.cuda.is_available()
+        else "cpu"
+    )
     print(f"Using device: {device}")
-    
-    # Load Model
+
+    # Load model
     model_path = os.path.join(BASE_DIR, config['model']['model_path'])
     model = SpectraNet(config)
-    
-    if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        print("Loaded best trained model.")
-    else:
-        print("WARNING: Model weights not found. Running with untrained weights!")
-        
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model weights not found: {model_path}")
+
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model = model.to(device)
     model.eval()
-    
-    # FIX: Point the Grad-CAM hook to the final SpectraBlock (index 2)
-    target_layer = model.feature_extractor[2]
-    grad_cam = GradCAM(model, target_layer)
-    
-    # Load some data to visualize
+    print("Loaded trained model.")
+
+    # Better Grad-CAM hook target than the whole block
+    target_layer = model.feature_extractor[2].fusion
+    grad_cam = SignedType2GradCAM1D(model, target_layer)
+
+    # Load data
     data_path = os.path.join(BASE_DIR, config['data']['processed_catalog'])
     df_clean = pd.read_parquet(data_path)
-    
-    meta_cols = ['filename', 'agn_type', 'z', 'snr', 'obj_id']
-    flux_cols = [c for c in df_clean.columns if c not in meta_cols]
-    wavelengths = np.array(flux_cols, dtype=float)
-    
-    # Grab one Type 1 and one Type 2 spectrum
-    type1_idx = df_clean[df_clean['agn_type'] == 1].index[0]
-    type2_idx = df_clean[df_clean['agn_type'] == 2].index[0]
-    
-    results = []
-    for idx in [type1_idx, type2_idx]:
-        sample_row = df_clean.loc[idx]
-        x_array = sample_row[flux_cols].values.astype(np.float32)
-        
-        # Convert to tensor (1, 1, Seq_Len)
-        x_tensor = torch.tensor(x_array).unsqueeze(0).unsqueeze(0).to(device)
-        
-        # FIX: Apply the morphological filter so the network sees the flattened continuum
-        x_tensor_processed = morphological_continuum_subtraction(x_tensor)
-        
-        actual_class = 1 if sample_row['agn_type'] == 2 else 0
-        
-        # Run Grad-CAM 
-        cam, pred_prob = grad_cam(x_tensor_processed, target_class=actual_class)
-        
-        # Extract the processed 1D array to plot as the background spectrum
-        processed_array = x_tensor_processed.squeeze().cpu().numpy()
-        
-        results.append({
-            'x_array': processed_array,
-            'cam': cam,
-            'pred_prob': pred_prob,
-            'actual_class': actual_class,
-            'target_class': actual_class
-        })
-        
-    # Plot combined
-    plot_path = os.path.join(BASE_DIR, 'models', 'gradcam_combined.png')
-    plot_combined_gradcam(results, wavelengths, filename=plot_path)
+
+    flux_cols, wavelengths = get_flux_columns_and_wavelengths(df_clean)
+
+    cams_by_class = collect_signed_cams_by_true_class(
+        df=df_clean,
+        flux_cols=flux_cols,
+        device=device,
+        grad_cam=grad_cam,
+        n_per_class=n_per_class,
+        only_correct=only_correct,
+        random_state=42
+    )
+
+    save_path = os.path.join(BASE_DIR, 'models', 'signed_gradcam_true_class_subplots.png')
+
+    plot_signed_cam_subplots(
+        cams_by_class=cams_by_class,
+        wavelengths=wavelengths,
+        filename=save_path,
+        title="Average Signed Grad-CAM by True Class"
+    )
+
+    grad_cam.remove_hooks()
+
+    return cams_by_class
 
 
 
@@ -285,21 +423,41 @@ def plot_transformer_attention(model, spec1, spec2, wavelengths):
             x_trans = features.permute(0, 2, 1) # [1, 64, 384]
             _, weights = model.global_corr.mha(x_trans, x_trans, x_trans)
         
-        attn_matrix = weights[0].cpu().numpy() # [64, 64]
-        
-        # 2. Sum along the query axis to see how much attention each token *received*
-        token_importance = attn_matrix.sum(axis=0)
-        
-        # 3. Normalize between 0 and 1
-        token_importance = token_importance - token_importance.min()
-        token_importance = token_importance / (token_importance.max() + 1e-8)
-        
-        # 4. Interpolate from 64 tokens back to 1024 pixels
-        token_tensor = torch.tensor(token_importance, dtype=torch.float32).view(1, 1, -1)
-        attn_map = torch.nn.functional.interpolate(
-            token_tensor, size=len(wavelengths), mode='linear', align_corners=False
-        ).squeeze().numpy()
-        
+
+            print(f"DEBUG: Raw weights shape: {weights.shape}")
+                
+            # PyTorch's native MHA can sometimes return [Batch, Num_Heads, Tokens, Tokens]
+            # If we don't catch this, the subsequent math will sum across the wrong axis!
+            if weights.ndim == 4:
+                print("DEBUG: 4D Tensor detected. Averaging across attention heads...")
+                weights = weights.mean(dim=1)
+
+            attn_matrix = weights[0].cpu().numpy() # [64, 64]
+            
+            # 2. Sum along the query axis to see how much attention each token *received*
+            token_importance = attn_matrix.sum(axis=0)
+            
+            if np.isnan(token_importance).any():
+                print("WARNING: NaN values detected in attention matrix!")
+            if token_importance.max() == 0:
+                print("WARNING: Token importance is completely flat (zeros).")
+
+
+            # 3. Normalize between 0 and 1
+            token_importance = token_importance - token_importance.min()
+            token_importance = token_importance / (token_importance.max() + 1e-8)
+            
+            # 4. Interpolate from 64 tokens back to 1024 pixels
+            token_tensor = torch.tensor(token_importance, dtype=torch.float32).view(1, 1, -1)
+            attn_map = torch.nn.functional.interpolate(
+                token_tensor, size=len(wavelengths), mode='linear', align_corners=False
+            ).squeeze().numpy()
+            
+            max_idx = attn_map.argmax()
+            max_wave = wavelengths[max_idx]
+            print(f"DEBUG: Maximum attention localized at exactly: {max_wave:.1f} Å")
+
+
         return attn_map
         
     attn_map1 = get_attn_1d(spec1)
@@ -338,4 +496,4 @@ def plot_transformer_attention(model, spec1, spec2, wavelengths):
 
 
 if __name__ == "__main__":
-    run_gradcam_analysis()
+    run_signed_gradcam_subplot_analysis()
