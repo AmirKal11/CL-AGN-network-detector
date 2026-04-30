@@ -1,0 +1,248 @@
+[
+    {
+        "run_name": "alpha_0p30_gamma_1p0_seed_42",
+        "seed": 42,
+        "focal_alpha": 0.3,
+        "focal_gamma": 1.0,
+        "best_epoch": 19,
+        "best_val_f1_during_training": 0.9821163407540434,
+        "val_metrics": {
+            "macro_f1": 0.9835523316490289,
+            "balanced_accuracy": 0.9852165520725715,
+            "type1_recall": 0.9799139167862266,
+            "type2_recall": 0.9905191873589165,
+            "confusion_matrix": [
+                [
+                    683,
+                    14
+                ],
+                [
+                    21,
+                    2194
+                ]
+            ]
+        },
+        "test_metrics": {
+            "macro_f1": 0.9578814106443934,
+            "balanced_accuracy": 0.9408484091923393,
+            "type1_recall": 0.8839541547277937,
+            "type2_recall": 0.9977426636568849,
+            "confusion_matrix": [
+                [
+                    617,
+                    81
+                ],
+                [
+                    5,
+                    2210
+                ]
+            ]
+        },
+        "model_path": "/Users/amir/Documents/Deep learning/cl-agn classifier/models/backbone_sweep/alpha_0p30_gamma_1p0_seed_42/best_spectranet.pth"
+    },
+    {
+        "run_name": "alpha_0p35_gamma_1p0_seed_42",
+        "seed": 42,
+        "focal_alpha": 0.35,
+        "focal_gamma": 1.0,
+        "best_epoch": 12,
+        "best_val_f1_during_training": 0.9825097013659425,
+        "val_metrics": {
+            "macro_f1": 0.9844618473967013,
+            "balanced_accuracy": 0.9851763928607284,
+            "type1_recall": 0.9784791965566715,
+            "type2_recall": 0.9918735891647855,
+            "confusion_matrix": [
+                [
+                    682,
+                    15
+                ],
+                [
+                    18,
+                    2197
+                ]
+            ]
+        },
+        "test_metrics": {
+            "macro_f1": 0.9578078168246329,
+            "balanced_accuracy": 0.9548891706067643,
+            "type1_recall": 0.9269340974212035,
+            "type2_recall": 0.982844243792325,
+            "confusion_matrix": [
+                [
+                    647,
+                    51
+                ],
+                [
+                    38,
+                    2177
+                ]
+            ]
+        },
+        "model_path": "/Users/amir/Documents/Deep learning/cl-agn classifier/models/backbone_sweep/alpha_0p35_gamma_1p0_seed_42/best_spectranet.pth"
+    },
+    {
+        "run_name": "alpha_0p40_gamma_1p0_seed_42",
+        "seed": 42,
+        "focal_alpha": 0.4,
+        "focal_gamma": 1.0,
+        "best_epoch": 9,
+        "best_val_f1_during_training": 0.9829061166986264,
+        "val_metrics": {
+            "macro_f1": 0.9843384291784765,
+            "balanced_accuracy": 0.9812433810169996,
+            "type1_recall": 0.9670014347202296,
+            "type2_recall": 0.9954853273137697,
+            "confusion_matrix": [
+                [
+                    674,
+                    23
+                ],
+                [
+                    10,
+                    2205
+                ]
+            ]
+        },
+        "test_metrics": {
+            "macro_f1": 0.9603937511047057,
+            "balanced_accuracy": 0.9439394723395448,
+            "type1_recall": 0.8896848137535817,
+            "type2_recall": 0.9981941309255079,
+            "confusion_matrix": [
+                [
+                    621,
+                    77
+                ],
+                [
+                    4,
+                    2211
+                ]
+            ]
+        },
+        "model_path": "/Users/amir/Documents/Deep learning/cl-agn classifier/models/backbone_sweep/alpha_0p40_gamma_1p0_seed_42/best_spectranet.pth"
+    },
+    {
+        "run_name": "alpha_0p45_gamma_1p0_seed_42",
+        "seed": 42,
+        "focal_alpha": 0.45,
+        "focal_gamma": 1.0,
+        "best_epoch": 9,
+        "best_val_f1_during_training": 0.9838234063911662,
+        "val_metrics": {
+            "macro_f1": 0.9833559755428211,
+            "balanced_accuracy": 0.9793170343069784,
+            "type1_recall": 0.9626972740315638,
+            "type2_recall": 0.9959367945823928,
+            "confusion_matrix": [
+                [
+                    671,
+                    26
+                ],
+                [
+                    9,
+                    2206
+                ]
+            ]
+        },
+        "test_metrics": {
+            "macro_f1": 0.9588167654737556,
+            "balanced_accuracy": 0.9412998764609624,
+            "type1_recall": 0.8839541547277937,
+            "type2_recall": 0.9986455981941309,
+            "confusion_matrix": [
+                [
+                    617,
+                    81
+                ],
+                [
+                    3,
+                    2212
+                ]
+            ]
+        },
+        "model_path": "/Users/amir/Documents/Deep learning/cl-agn classifier/models/backbone_sweep/alpha_0p45_gamma_1p0_seed_42/best_spectranet.pth"
+    },
+    {
+        "run_name": "alpha_0p50_gamma_1p0_seed_42",
+        "seed": 42,
+        "focal_alpha": 0.5,
+        "focal_gamma": 1.0,
+        "best_epoch": 13,
+        "best_val_f1_during_training": 0.9838718820676988,
+        "val_metrics": {
+            "macro_f1": 0.9862641844562838,
+            "balanced_accuracy": 0.9841128214761101,
+            "type1_recall": 0.9727403156384505,
+            "type2_recall": 0.9954853273137697,
+            "confusion_matrix": [
+                [
+                    678,
+                    19
+                ],
+                [
+                    10,
+                    2205
+                ]
+            ]
+        },
+        "test_metrics": {
+            "macro_f1": 0.9499136295130857,
+            "balanced_accuracy": 0.9281410285433389,
+            "type1_recall": 0.8567335243553008,
+            "type2_recall": 0.999548532731377,
+            "confusion_matrix": [
+                [
+                    598,
+                    100
+                ],
+                [
+                    1,
+                    2214
+                ]
+            ]
+        },
+        "model_path": "/Users/amir/Documents/Deep learning/cl-agn classifier/models/backbone_sweep/alpha_0p50_gamma_1p0_seed_42/best_spectranet.pth"
+    },
+    {
+        "run_name": "alpha_0p84_gamma_2p0_seed_42",
+        "seed": 42,
+        "focal_alpha": 0.84,
+        "focal_gamma": 2.0,
+        "best_epoch": 15,
+        "best_val_f1_during_training": 0.9805222316753552,
+        "val_metrics": {
+            "macro_f1": 0.9857550972488553,
+            "balanced_accuracy": 0.9824122084004003,
+            "type1_recall": 0.9684361549497847,
+            "type2_recall": 0.9963882618510158,
+            "confusion_matrix": [
+                [
+                    675,
+                    22
+                ],
+                [
+                    8,
+                    2207
+                ]
+            ]
+        },
+        "test_metrics": {
+            "macro_f1": 0.9587559557723939,
+            "balanced_accuracy": 0.9558312366192993,
+            "type1_recall": 0.9283667621776505,
+            "type2_recall": 0.983295711060948,
+            "confusion_matrix": [
+                [
+                    648,
+                    50
+                ],
+                [
+                    37,
+                    2178
+                ]
+            ]
+        },
+        "model_path": "/Users/amir/Documents/Deep learning/cl-agn classifier/models/backbone_sweep/alpha_0p84_gamma_2p0_seed_42/best_spectranet.pth"
+    }
+]

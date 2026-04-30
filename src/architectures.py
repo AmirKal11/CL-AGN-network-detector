@@ -197,10 +197,6 @@ class SpectraNet(nn.Module):
         return class_output, redshift_output
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 class SiameseSpectraNet(nn.Module):
     def __init__(self, pretrained_spectranet, freeze_backbone=True):
         super().__init__()
@@ -230,19 +226,21 @@ class SiameseSpectraNet(nn.Module):
         )
 
     def forward_one_branch(self, x):
-        """Extracts the 1D embedding for a single epoch's spectrum."""
-        features = self.feature_extractor(x)
-        features = features.permute(0, 2, 1) 
-        
-        # Transformer Multi-Head Attention
-        attn_out, _ = self.transformer.mha(features, features, features)
-        
-        # Apply your Global Avg + Max Pooling (matching your base architecture)
-        avg_pool = torch.mean(attn_out, dim=1)
-        max_pool, _ = torch.max(attn_out, dim=1)
-        embedding_1d = torch.cat([avg_pool, max_pool], dim=1) # Shape: [Batch, 512]
-        
-        return embedding_1d
+        """
+        Extract the same 512-dim embedding used by the original SpectraNet backbone.
+        """
+        features = self.feature_extractor(x)          # [B, 256, L]
+        features = features.permute(0, 2, 1)          # [B, L, 256]
+
+        features, _ = self.transformer(features)      # use full TransformerStage
+
+        features = features.permute(0, 2, 1)          # [B, 256, L]
+
+        avg_pool = torch.mean(features, dim=-1)       # [B, 256]
+        max_pool, _ = torch.max(features, dim=-1)     # [B, 256]
+
+        embedding = torch.cat([avg_pool, max_pool], dim=1)  # [B, 512]
+        return embedding
 
     def forward(self, x_t1, x_t2):
         """Processes both epochs and predicts if a change occurred."""

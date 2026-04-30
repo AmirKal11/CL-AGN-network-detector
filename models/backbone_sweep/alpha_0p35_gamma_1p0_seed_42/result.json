@@ -1,0 +1,41 @@
+{
+    "run_name": "alpha_0p35_gamma_1p0_seed_42",
+    "seed": 42,
+    "focal_alpha": 0.35,
+    "focal_gamma": 1.0,
+    "best_epoch": 12,
+    "best_val_f1_during_training": 0.9825097013659425,
+    "val_metrics": {
+        "macro_f1": 0.9844618473967013,
+        "balanced_accuracy": 0.9851763928607284,
+        "type1_recall": 0.9784791965566715,
+        "type2_recall": 0.9918735891647855,
+        "confusion_matrix": [
+            [
+                682,
+                15
+            ],
+            [
+                18,
+                2197
+            ]
+        ]
+    },
+    "test_metrics": {
+        "macro_f1": 0.9578078168246329,
+        "balanced_accuracy": 0.9548891706067643,
+        "type1_recall": 0.9269340974212035,
+        "type2_recall": 0.982844243792325,
+        "confusion_matrix": [
+            [
+                647,
+                51
+            ],
+            [
+                38,
+                2177
+            ]
+        ]
+    },
+    "model_path": "/Users/amir/Documents/Deep learning/cl-agn classifier/models/backbone_sweep/alpha_0p35_gamma_1p0_seed_42/best_spectranet.pth"
+}

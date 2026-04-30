@@ -53,11 +53,7 @@ def train_one_epoch_siamese(model, dataloader, criterion, optimizer, device, thr
     for batch_x1, batch_x2, batch_y in dataloader:
         batch_x1, batch_x2, batch_y = batch_x1.to(device), batch_x2.to(device), batch_y.to(device)
 
-        # 1. Apply the mandatory morphological flattening to both inputs
-        batch_x1 = morphological_continuum_subtraction(batch_x1)
-        batch_x2 = morphological_continuum_subtraction(batch_x2)
-
-        optimizer.zero_grad()
+    
 
         # 2. Forward pass through the Siamese Network
         logits = model(batch_x1, batch_x2)
@@ -89,9 +85,6 @@ def validate_one_epoch_siamese(model, dataloader, criterion, device,threshold):
     with torch.no_grad():
         for batch_x1, batch_x2, batch_y in dataloader:
             batch_x1, batch_x2, batch_y = batch_x1.to(device), batch_x2.to(device), batch_y.to(device)
-
-            batch_x1 = morphological_continuum_subtraction(batch_x1)
-            batch_x2 = morphological_continuum_subtraction(batch_x2)
 
             logits = model(batch_x1, batch_x2)
             loss = criterion(logits, batch_y)
@@ -224,8 +217,6 @@ def train_siamese():
     with torch.no_grad():
         for batch_x1, batch_x2, batch_y in test_loader:
             batch_x1, batch_x2, batch_y = batch_x1.to(device), batch_x2.to(device), batch_y.to(device)
-            batch_x1 = morphological_continuum_subtraction(batch_x1)
-            batch_x2 = morphological_continuum_subtraction(batch_x2)
             logits = model(batch_x1, batch_x2)
             probs = torch.sigmoid(logits)
             preds = (probs >= config['siamese_training']['decision_threshold']).float()
@@ -264,14 +255,10 @@ def train_siamese():
     sample_x1 = sample_x1.to(device)  # Shape: [1, 1024]
     sample_x2 = sample_x2.to(device)  # Shape: [1, 1024]
     pair_label = int(sample_label.item())
-
-    # Apply the morphological filter (same preprocessing as training)
-    sample_x1_proc = morphological_continuum_subtraction(sample_x1.unsqueeze(0))  # [1, 1, 1024]
-    sample_x2_proc = morphological_continuum_subtraction(sample_x2.unsqueeze(0))  # [1, 1, 1024]
-
+    
     # Get the siamese prediction for this pair
     with torch.no_grad():
-        pair_logits = model(sample_x1_proc, sample_x2_proc)
+        pair_logits = model(sample_x1, sample_x2)
         pair_prob = torch.sigmoid(pair_logits).item()
         pair_pred = 1 if pair_prob >= config['siamese_training']['decision_threshold'] else 0
 
