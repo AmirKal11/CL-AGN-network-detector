@@ -98,66 +98,235 @@ def prepare_for_nn(df_clean):
     return X, y, z_scaled
     
 class AGNSpectraDataset(Dataset):
-    def __init__(self, X, y, wavelengths=None, z=None, apply_masking=False, mask_lines=False):
+    def __init__(
+        self,
+        X,
+        y,
+        wavelengths=None,
+        z=None,
+        apply_masking=False,
+        mask_lines=False,
+    ):
+        """
+        Dataset for AGN spectra.
+
+        Parameters
+        ----------
+        X : array-like
+            Spectra array with shape [N, 1, L].
+
+        y : array-like
+            Binary labels.
+            Type 1 -> 0
+            Type 2 -> 1
+
+        wavelengths : array-like
+            Rest-frame wavelength grid with shape [L].
+
+        z : array-like
+            Redshift values, usually scaled before being passed here.
+
+        apply_masking : bool
+            Training-time random augmentation.
+            Masks a random sub-window inside one broad-line-sensitive region.
+
+        mask_lines : bool
+            Deterministic aggressive shortcut-learning ablation.
+            Masks all major diagnostic regions.
+        """
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32).view(-1, 1)
-        
-        # Ensure z is passed and converted to a tensor
+
         if z is None:
             raise ValueError("Redshift (z) must be provided for adversarial training.")
         self.z = torch.tensor(z, dtype=torch.float32).view(-1, 1)
-        
+
         self.apply_masking = apply_masking
         self.mask_lines = mask_lines
-        self.wavelengths = torch.tensor(wavelengths, dtype=torch.float32) if wavelengths is not None else None
-        
-        # Mask ranges widened to cover BROAD LINE WINGS, not just cores:
-        # (4575, 5550): Hβ broad wings + [O III] + Fe II pseudo-continuum
-        # (5800, 5950): He I 5876 broad
-        # (6200, 6699): [O I] 6300 + [N II] + Hα broad wings + [S II]
-        self.mask_ranges = [(4575, 5550), (5800, 5950), (6200, 6699)]
+
+        if wavelengths is None:
+            self.wavelengths = None
+        else:
+            self.wavelengths = torch.tensor(wavelengths, dtype=torch.float32)
+
+        # ------------------------------------------------------------
+        # 1. Training augmentation regions
+        # ------------------------------------------------------------
+        # These are NOT meant to erase all diagnostics.
+        # They randomly remove part of broad-line-sensitive regions
+        # to improve robustness and reduce dependence on one exact feature.
+        #
+        # Narrow forbidden lines are intentionally not targeted here,
+        # because they are relatively consistent in both classes.
+        self.augmentation_line_regions = [
+            ("Hb_broad", 4700.0, 5000.0),
+            ("Ha_broad", 6350.0, 6699.0),
+        ]
+
+        # Fraction of the selected broad-line region to mask.
+        # Example: if the selected region contains 150 pixels,
+        # mask between 15 and 90 pixels.
+        self.augmentation_min_frac = 0.10
+        self.augmentation_max_frac = 0.60
+
+        # Probability of applying the broad-line augmentation.
+        # Since this dataset only uses apply_masking=True for train,
+        # you can keep this at 1.0, or lower it to 0.5–0.8 if too aggressive.
+        self.augmentation_prob = 1.0
+
+        # Optional extra random local mask, similar to SpecAugment.
+        # Keep this small. It should improve robustness, not destroy spectra.
+        self.use_extra_random_mask = True
+        self.extra_random_mask_prob = 0.30
+        self.extra_random_mask_len_range = (20, 60)
+
+        # ------------------------------------------------------------
+        # 2. Aggressive shortcut-learning ablation regions
+        # ------------------------------------------------------------
+        # These are deliberately broad and deterministic.
+        # They are for testing whether the model can still classify
+        # after the main diagnostic regions are removed.
+        self.aggressive_mask_regions = [
+            (4575.0, 5550.0),  # Hβ + [O III] + Fe II / blue diagnostic region
+            (5800.0, 5950.0),  # He I 5876 region
+            (6200.0, 6699.0),  # [O I] + Hα + [N II] / red diagnostic region
+        ]
 
     def __len__(self):
         return len(self.X)
 
+    def _mask_wavelength_range(self, x, start_wave, end_wave):
+        """
+        Mask a wavelength interval by setting it to zero.
+        """
+        if self.wavelengths is None:
+            return x
+
+        mask = (self.wavelengths >= start_wave) & (self.wavelengths <= end_wave)
+        x[..., mask] = 0.0
+        return x
+
+    def _apply_random_broad_line_mask(self, x):
+        """
+        Training-time augmentation.
+
+        Choose one broad-line-sensitive region, then mask a random
+        contiguous sub-window inside that region.
+
+        This is intentionally milder than the aggressive shortcut test.
+        """
+        if self.wavelengths is None:
+            return x
+
+        if torch.rand(1).item() > self.augmentation_prob:
+            return x
+
+        # Choose Hb or Ha region randomly.
+        region_idx = torch.randint(
+            low=0,
+            high=len(self.augmentation_line_regions),
+            size=(1,),
+        ).item()
+
+        _, region_start, region_end = self.augmentation_line_regions[region_idx]
+
+        region_mask = (
+            (self.wavelengths >= region_start)
+            & (self.wavelengths <= region_end)
+        )
+        valid_idx = torch.where(region_mask)[0]
+
+        if valid_idx.numel() < 2:
+            return x
+
+        min_len = max(2, int(self.augmentation_min_frac * valid_idx.numel()))
+        max_len = max(min_len, int(self.augmentation_max_frac * valid_idx.numel()))
+
+        # torch.randint high is exclusive, so use max_len + 1.
+        mask_len = torch.randint(
+            low=min_len,
+            high=max_len + 1,
+            size=(1,),
+        ).item()
+
+        max_start = valid_idx.numel() - mask_len
+        if max_start < 0:
+            return x
+
+        start_pos = torch.randint(
+            low=0,
+            high=max_start + 1,
+            size=(1,),
+        ).item()
+
+        selected_idx = valid_idx[start_pos:start_pos + mask_len]
+        x[..., selected_idx] = 0.0
+
+        return x
+
+    def _apply_extra_random_mask(self, x):
+        """
+        Optional small random local mask outside the physically targeted logic.
+        This is a mild robustness augmentation.
+        """
+        if torch.rand(1).item() > self.extra_random_mask_prob:
+            return x
+
+        seq_len = x.shape[-1]
+        min_len, max_len = self.extra_random_mask_len_range
+
+        if seq_len <= min_len:
+            return x
+
+        max_len = min(max_len, seq_len - 1)
+
+        mask_len = torch.randint(
+            low=min_len,
+            high=max_len + 1,
+            size=(1,),
+        ).item()
+
+        start_idx = torch.randint(
+            low=0,
+            high=seq_len - mask_len + 1,
+            size=(1,),
+        ).item()
+
+        x[..., start_idx:start_idx + mask_len] = 0.0
+        return x
+
+    def _apply_aggressive_line_ablation(self, x):
+        """
+        Deterministic shortcut-learning test.
+
+        Masks all major diagnostic regions. This should only be used for
+        ablation/evaluation, not normal training augmentation.
+        """
+        if self.wavelengths is None:
+            return x
+
+        for start_wave, end_wave in self.aggressive_mask_regions:
+            x = self._mask_wavelength_range(x, start_wave, end_wave)
+
+        return x
+
     def __getitem__(self, idx):
         x = self.X[idx].clone()
         y = self.y[idx]
-        z = self.z[idx] # FIXED: Changed self.z_scaled to self.z
+        z = self.z[idx]
 
-        if self.mask_lines and self.wavelengths is not None:
-            # 1. Build a boolean mask for ALL line regions at once
-            line_mask = torch.zeros(self.wavelengths.shape, dtype=torch.bool)
-            for start_wave, end_wave in self.mask_ranges:
-                line_mask |= (self.wavelengths >= start_wave) & (self.wavelengths <= end_wave)
-            
-            # 2. Zero out the line regions
-            x[..., line_mask] = 0.0
-            
-            # 3. RE-NORMALIZE using only the UNMASKED pixels
-            #    This removes the global statistical fingerprint that the original
-            #    normalization (computed with lines present) baked into the continuum.
-            #unmasked = x[..., ~line_mask]
-            #if unmasked.numel() > 0:
-            #    mean = unmasked.mean()
-            #    std = unmasked.std()
-            #    x[..., ~line_mask] = (unmasked - mean) / (std + 1e-8)
+        # Deterministic aggressive masking for shortcut-learning tests.
+        # Usually used only when creating a masked validation/test loader.
+        if self.mask_lines:
+            x = self._apply_aggressive_line_ablation(x)
 
+        # Random training augmentation.
+        # Usually apply_masking=True only for the training dataset.
         if self.apply_masking:
-            seq_len = x.shape[-1]
-            
-            # 1. TARGETED H-ALPHA DROPOUT (50% chance)
-            # Force the network to survive without the red edge crutch
-            if torch.rand(1).item() < 0.5:
-                x[..., -250:] = 0.0
-                
-            # 2. RANDOM SPECAUGMENT (The Whack-a-Mole Defense)
-            # Drop 1 or 2 smaller random masks to force continuum learning
-            num_masks = torch.randint(1, 3, (1,)).item()
-            for _ in range(num_masks):
-                mask_len = torch.randint(30, 100, (1,)).item()
-                start_idx = torch.randint(0, seq_len - mask_len, (1,)).item()
-                x[..., start_idx:start_idx + mask_len] = 0.0
+            x = self._apply_random_broad_line_mask(x)
+
+            if self.use_extra_random_mask:
+                x = self._apply_extra_random_mask(x)
 
         return x, y, z
 
@@ -195,7 +364,7 @@ def prepare_agn_data(df, batch_size=256, random_state=42, mask_lines=False):
 
     # --- NEW: Pass z to Datasets ---
     train_ds = AGNSpectraDataset(X_train, y_train, z=z_train, wavelengths=wavelengths, apply_masking=True, mask_lines=mask_lines)
-    val_ds   = AGNSpectraDataset(X_val, y_val, z=z_val, wavelengths=wavelengths, apply_masking=True, mask_lines=mask_lines)
+    val_ds   = AGNSpectraDataset(X_val, y_val, z=z_val, wavelengths=wavelengths, apply_masking=False, mask_lines=mask_lines)
     test_ds  = AGNSpectraDataset(X_test, y_test, z=z_test, wavelengths=wavelengths, apply_masking=False, mask_lines=mask_lines)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
