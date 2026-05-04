@@ -137,11 +137,11 @@ class AGNSpectraDataset(Dataset):
             # 3. RE-NORMALIZE using only the UNMASKED pixels
             #    This removes the global statistical fingerprint that the original
             #    normalization (computed with lines present) baked into the continuum.
-            unmasked = x[..., ~line_mask]
-            if unmasked.numel() > 0:
-                mean = unmasked.mean()
-                std = unmasked.std()
-                x[..., ~line_mask] = (unmasked - mean) / (std + 1e-8)
+            #unmasked = x[..., ~line_mask]
+            #if unmasked.numel() > 0:
+            #    mean = unmasked.mean()
+            #    std = unmasked.std()
+            #    x[..., ~line_mask] = (unmasked - mean) / (std + 1e-8)
 
         if self.apply_masking:
             seq_len = x.shape[-1]
