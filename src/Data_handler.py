@@ -111,7 +111,11 @@ class AGNSpectraDataset(Dataset):
         self.mask_lines = mask_lines
         self.wavelengths = torch.tensor(wavelengths, dtype=torch.float32) if wavelengths is not None else None
         
-        self.mask_ranges = [(4800, 5100), (6500, 6650), (4575, 4800)]
+        # Mask ranges widened to cover BROAD LINE WINGS, not just cores:
+        # (4575, 5550): Hβ broad wings + [O III] + Fe II pseudo-continuum
+        # (5800, 5950): He I 5876 broad
+        # (6200, 6699): [O I] 6300 + [N II] + Hα broad wings + [S II]
+        self.mask_ranges = [(4575, 5550), (5800, 5950), (6200, 6699)]
 
     def __len__(self):
         return len(self.X)
@@ -122,9 +126,22 @@ class AGNSpectraDataset(Dataset):
         z = self.z[idx] # FIXED: Changed self.z_scaled to self.z
 
         if self.mask_lines and self.wavelengths is not None:
+            # 1. Build a boolean mask for ALL line regions at once
+            line_mask = torch.zeros(self.wavelengths.shape, dtype=torch.bool)
             for start_wave, end_wave in self.mask_ranges:
-                mask_idx = (self.wavelengths >= start_wave) & (self.wavelengths <= end_wave)
-                x[..., mask_idx] = 0.0
+                line_mask |= (self.wavelengths >= start_wave) & (self.wavelengths <= end_wave)
+            
+            # 2. Zero out the line regions
+            x[..., line_mask] = 0.0
+            
+            # 3. RE-NORMALIZE using only the UNMASKED pixels
+            #    This removes the global statistical fingerprint that the original
+            #    normalization (computed with lines present) baked into the continuum.
+            unmasked = x[..., ~line_mask]
+            if unmasked.numel() > 0:
+                mean = unmasked.mean()
+                std = unmasked.std()
+                x[..., ~line_mask] = (unmasked - mean) / (std + 1e-8)
 
         if self.apply_masking:
             seq_len = x.shape[-1]
@@ -177,9 +194,9 @@ def prepare_agn_data(df, batch_size=256, random_state=42, mask_lines=False):
     pos_weight = torch.tensor([num_neg / num_pos], dtype=torch.float32)
 
     # --- NEW: Pass z to Datasets ---
-    train_ds = AGNSpectraDataset(X_train, y_train, z=z_train, wavelengths=wavelengths, apply_masking=True, mask_lines=True)
-    val_ds   = AGNSpectraDataset(X_val, y_val, z=z_val, wavelengths=wavelengths, apply_masking=True, mask_lines=True)
-    test_ds  = AGNSpectraDataset(X_test, y_test, z=z_test, wavelengths=wavelengths, apply_masking=False, mask_lines=False)
+    train_ds = AGNSpectraDataset(X_train, y_train, z=z_train, wavelengths=wavelengths, apply_masking=True, mask_lines=mask_lines)
+    val_ds   = AGNSpectraDataset(X_val, y_val, z=z_val, wavelengths=wavelengths, apply_masking=True, mask_lines=mask_lines)
+    test_ds  = AGNSpectraDataset(X_test, y_test, z=z_test, wavelengths=wavelengths, apply_masking=False, mask_lines=mask_lines)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
@@ -187,56 +204,164 @@ def prepare_agn_data(df, batch_size=256, random_state=42, mask_lines=False):
     
     return train_loader, val_loader, test_loader, pos_weight
 
-
 class SyntheticSiameseDataset(Dataset):
-    def __init__(self, df, flux_cols, epoch_size=2000):
+    def __init__(
+        self,
+        df,
+        flux_cols,
+        epoch_size=2000,
+        k_neighbors=20,
+        mode="train",
+        change_pair_prob=0.15,
+        mask_lines=False,
+    ):
         """
-        df: The pandas dataframe (df_clean)
-        flux_cols: List of the wavelength column names
-        epoch_size: Arbitrary number of pairs to generate per epoch
+        Dynamically generates Siamese pairs.
+
+        label 0 = static-like pair:
+            Type 1 + Type 1
+            or Type 2 + Type 2
+
+        label 1 = change-like pair:
+            Type 1 + Type 2
+            or Type 2 + Type 1
+
+        Args:
+            df:
+                DataFrame containing spectra and metadata.
+
+            flux_cols:
+                List of wavelength/flux columns.
+
+            epoch_size:
+                Number of generated pairs per epoch.
+
+            k_neighbors:
+                For train mode, choose randomly from nearest k matched objects.
+
+            mode:
+                "train" -> random neighbor among nearest k
+                "val" / "test" -> deterministic nearest neighbor
+
+            change_pair_prob:
+                Probability of generating a change-like pair.
+                Example:
+                    0.15 means 15% change-like, 85% static-like.
         """
-        self.df = df
+        self.df = df.reset_index(drop=True)
         self.flux_cols = flux_cols
         self.epoch_size = epoch_size
-        
-        # Pre-sort indices by class so we can sample them instantly
-        self.t1_indices = self.df[self.df['agn_type'] == 1].index.values
-        self.t2_indices = self.df[self.df['agn_type'] == 2].index.values
+        self.k_neighbors = k_neighbors
+        self.mode = mode
+        self.change_pair_prob = change_pair_prob
+        self.mask_lines = mask_lines
+        self.mask_ranges = [(4800, 5100), (6500, 6650), (4575, 4800)]
+        self.wavelengths = np.array(self.flux_cols).astype(float)
+
+        if self.mode not in ["train", "val", "test"]:
+            raise ValueError(f"mode must be 'train', 'val', or 'test', got {mode}")
+
+        if not (0.0 <= self.change_pair_prob <= 1.0):
+            raise ValueError(
+                f"change_pair_prob must be between 0 and 1, got {change_pair_prob}"
+            )
+
+        self.indices_by_type = {
+            1: self.df[self.df["agn_type"] == 1].index.values,
+            2: self.df[self.df["agn_type"] == 2].index.values,
+        }
+
+        if len(self.indices_by_type[1]) == 0:
+            raise ValueError("No Type 1 AGN found in dataframe.")
+
+        if len(self.indices_by_type[2]) == 0:
+            raise ValueError("No Type 2 AGN found in dataframe.")
+
+        self.z_std = self.df["z"].std() + 1e-8
+        self.snr_std = self.df["snr"].std() + 1e-8
 
     def __len__(self):
-        # Because we are generating pairs randomly, the concept of "dataset length" 
-        # is arbitrary. We set it to a fixed size per epoch.
         return self.epoch_size
 
     def get_spectrum(self, idx):
-        # Extract, convert to float32, and add the channel dimension [1, Seq_Len]
         x = self.df.loc[idx, self.flux_cols].values.astype(np.float32)
-        return torch.tensor(x).unsqueeze(0) 
+        if self.mask_lines:
+            for start_wave, end_wave in self.mask_ranges:
+                mask_idx = (self.wavelengths >= start_wave) & (self.wavelengths <= end_wave)
+                x[mask_idx] = 0.0
+        return torch.tensor(x).unsqueeze(0)  # [1, SeqLen]
+
+    def find_matched_partner(self, anchor_idx, partner_type):
+        anchor = self.df.loc[anchor_idx]
+
+        candidate_indices = self.indices_by_type[partner_type]
+
+        # Avoid pairing object with itself when possible.
+        if "obj_id" in self.df.columns:
+            candidate_indices = np.array([
+                idx for idx in candidate_indices
+                if self.df.loc[idx, "obj_id"] != anchor["obj_id"]
+            ])
+        else:
+            candidate_indices = np.array([
+                idx for idx in candidate_indices
+                if idx != anchor_idx
+            ])
+
+        if len(candidate_indices) == 0:
+            raise RuntimeError(
+                f"No valid partner candidates found for "
+                f"anchor_idx={anchor_idx}, partner_type={partner_type}"
+            )
+
+        candidates = self.df.loc[candidate_indices]
+
+        dz = (candidates["z"].values - anchor["z"]) / self.z_std
+        dsnr = (candidates["snr"].values - anchor["snr"]) / self.snr_std
+
+        dist = dz**2 + dsnr**2
+
+        if self.mode == "train":
+            k = min(self.k_neighbors, len(candidate_indices))
+            nearest_positions = np.argsort(dist)[:k]
+            chosen_position = np.random.choice(nearest_positions)
+        else:
+            chosen_position = np.argmin(dist)
+
+        partner_idx = candidate_indices[chosen_position]
+        return partner_idx
 
     def __getitem__(self, i):
-        # 1. Flip a coin: 50% chance of Change (1) or Static (0)
-        target = np.random.randint(0, 2)
-        
-        if target == 1: 
-            # STATE CHANGE: Pick one random Type 1 and one random Type 2
-            idx1 = np.random.choice(self.t1_indices)
-            idx2 = np.random.choice(self.t2_indices)
-        else: 
-            # STATIC: 50% chance of T1+T1, 50% chance of T2+T2
-            if np.random.rand() > 0.5:
-                idx1 = np.random.choice(self.t1_indices)
-                idx2 = np.random.choice(self.t1_indices)
-            else:
-                idx1 = np.random.choice(self.t2_indices)
-                idx2 = np.random.choice(self.t2_indices)
+        # 1. Choose pair label according to desired prior.
+        # target = 1 means change-like.
+        # target = 0 means static-like.
+        target = 1 if np.random.rand() < self.change_pair_prob else 0
 
-        x1 = self.get_spectrum(idx1)
-        x2 = self.get_spectrum(idx2)
-        
-        # 2. Randomly swap the chronological order
-        # We don't want the network memorizing that Type 1 is always 'x1'.
-        # A change is a change, regardless of direction.
-        if np.random.rand() > 0.5:
+        # 2. Choose anchor type.
+        anchor_type = np.random.choice([1, 2])
+
+        # 3. Choose anchor object.
+        anchor_idx = np.random.choice(self.indices_by_type[anchor_type])
+
+        # 4. Choose partner type based on target.
+        if target == 0:
+            partner_type = anchor_type
+        else:
+            partner_type = 2 if anchor_type == 1 else 1
+
+        # 5. Find matched partner in z/SNR space.
+        partner_idx = self.find_matched_partner(
+            anchor_idx=anchor_idx,
+            partner_type=partner_type,
+        )
+
+        x1 = self.get_spectrum(anchor_idx)
+        x2 = self.get_spectrum(partner_idx)
+
+        # 6. Randomly swap order during training only.
+        if self.mode == "train" and np.random.rand() > 0.5:
             x1, x2 = x2, x1
 
-        return x1, x2, torch.tensor([target], dtype=torch.float32)
+        y = torch.tensor([target], dtype=torch.float32)
+
+        return x1, x2, y

@@ -30,10 +30,15 @@ def morphological_continuum_subtraction(x, window_size=151, clip_max=4.0, taper_
     # 3. Subtract the continuum from the original flux
     x_flattened = x - continuum
     
-    # 4. Standardize the result to ensure numeric stability for the CNN
-    mean = x_flattened.mean(dim=-1, keepdim=True)
-    std = x_flattened.std(dim=-1, keepdim=True)
-    x_normalized = (x_flattened - mean) / (std + 1e-8)
+    # 4. ROBUST NORMALIZATION (Median / MAD)
+    #    Mean/std is dominated by emission lines and leaks class info into the
+    #    continuum scale (Type 1 broad lines → large std → compressed continuum).
+    #    Median/MAD is robust to emission-line outliers, so both classes get
+    #    a similar continuum scale while preserving line SHAPE.
+    median = x_flattened.median(dim=-1, keepdim=True).values
+    mad = (x_flattened - median).abs().median(dim=-1, keepdim=True).values
+    # 1.4826 makes MAD consistent with std for Gaussian-distributed noise
+    x_normalized = (x_flattened - median) / (mad * 1.4826 + 1e-8)
     
     # 5. DECAPITATE NARROW LINES (The Grad-CAM Fix)
     # This prevents the network from using the [O III] / Narrow Balmer ratio to cheat
@@ -321,7 +326,7 @@ def run_preprocessing(mode='full', existing_parquet='data/processed_agn_catalog_
     
     print("\nCleaning dataset...")
     df_clean = clean_dataset(df, max_zeros_pct=0.5, min_snr=5.0, 
-                             max_flux_outlier=30.0, max_neg_flux=5.0)
+                             max_flux_outlier=100.0, max_neg_flux=20.0)
 
     df_clean.to_parquet(output)
     print(f'\nSaved cleaned df with {len(df_clean)} spectra to {output}')
@@ -330,4 +335,4 @@ def run_preprocessing(mode='full', existing_parquet='data/processed_agn_catalog_
 
 # --- EXECUTION ---
 if __name__ == "__main__":
-    run_preprocessing(mode='new_only', output='data/processed_agn_new.parquet')
+    run_preprocessing(mode='new_only', output='data/processed_agn_new_MAD_scaling.parquet')

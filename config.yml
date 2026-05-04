@@ -1,6 +1,6 @@
 # Project paths
 data:
-  processed_catalog: 'data/processed_agn_new.parquet'
+  processed_catalog: 'data/processed_agn_new_MAD_scaling.parquet'
 
 # Neural Network Training Configurations
 training:
@@ -29,3 +29,9 @@ siamese_training:
   test_size: 0.2
   random_state: 42
   decision_threshold: 0.5
+  seed: 42
+  min_recall: 0.5
+  max_fpr: 0.05
+  
+  train_change_pair_prob: 0.15
+  eval_change_pair_prob: 0.02

@@ -40,51 +40,6 @@ from model_interpertation import run_signed_gradcam_subplot_analysis, plot_atten
 import torch.nn.functional as F
 
 
-def morphological_continuum_subtraction(x, window_size=151, clip_max=4.0, taper_len=5):
-    """
-    Acts as a lightweight spectral decomposition by estimating and subtracting 
-    the continuum envelope using morphological pooling.
-    x: [Batch, 1, Sequence_Length]
-    """
-    # 1. Pad the sequence to handle edge artifacts smoothly
-    pad = window_size // 2
-    x_padded = F.pad(x, (pad, pad), mode='reflect')
-    
-    # 2. Extract the continuum envelope using a wide average pool
-    # This acts as a low-pass filter, ignoring sharp narrow lines and following the slope
-    continuum = F.avg_pool1d(x_padded, kernel_size=window_size, stride=1)
-    
-    # 3. Subtract the continuum from the original flux
-    x_flattened = x - continuum
-    
-    # 4. Standardize the result to ensure numeric stability for the CNN
-    mean = x_flattened.mean(dim=-1, keepdim=True)
-    std = x_flattened.std(dim=-1, keepdim=True)
-    x_normalized = (x_flattened - mean) / (std + 1e-8)
-    
-    # 5. DECAPITATE NARROW LINES (The Grad-CAM Fix)
-    # This prevents the network from using the [O III] / Narrow Balmer ratio to cheat
-    x_clipped = torch.clamp(x_normalized, min=-10.0, max=clip_max)
-    
-    # 6. EDGE TAPERING (The Limits Fix)
-    # Surgically fade the first and last 5 pixels to destroy reflection artifacts
-    seq_len = x.shape[-1]
-    taper = torch.ones(seq_len, device=x.device)
-    
-    # Create a linear fade from 0 to 1
-    fade = torch.linspace(0, 1, taper_len, device=x.device)
-    
-    # Apply to left and right edges
-    taper[:taper_len] = fade
-    taper[-taper_len:] = torch.flip(fade, dims=[0])
-    
-    # Reshape so it broadcasts perfectly over (Batch, Channels, SeqLen)
-    taper = taper.view(1, 1, -1)
-    
-    # Apply the taper to the clipped tensor
-    x_final = x_clipped * taper
-
-    return x_final
 
 
 def seed_everything(seed=42):
@@ -151,7 +106,6 @@ def evaluate_model(model, dataloader, device, title="Evaluation", save_cm_path=N
         disp.plot(cmap="Blues")
         plt.title(title)
         plt.savefig(save_cm_path, dpi=300)
-        plt.show()
         plt.close()
 
     return {
@@ -391,183 +345,52 @@ def train_single_config(
 
     return result
 
-def train_single_config(
-    config,
-    df_clean,
-    device,
-    models_dir,
-    run_name,
-    focal_alpha,
-    focal_gamma,
-    seed=42,
-):
-    print("\n" + "=" * 80)
-    print(f"Starting run: {run_name}")
-    print(f"Seed: {seed} | focal_alpha: {focal_alpha} | focal_gamma: {focal_gamma}")
-    print("=" * 80)
 
+def evaluate_masked_backbone():
+    print("\n=== Evaluating on test set with MASKED lines (Backbone) ===")
+    
+    config = load_config(os.path.join(BASE_DIR, 'config.yml'))
+    seed = int(config['training'].get('seed', 42))
     seed_everything(seed)
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+    models_dir = os.path.join(BASE_DIR, 'models/selected_backbone/')
+    
+    # Load dataset
+    df_clean = pd.read_parquet(os.path.join(BASE_DIR, config['data']['processed_catalog']))
+    df_clean = df_clean.sort_values('snr', ascending=False).drop_duplicates(subset=['obj_id'])
 
-    # Important: this keeps the split reproducible.
-    train_loader, val_loader, test_loader, pos_weight = prepare_agn_data(
+    if config["training"].get("redshift_overlap", False):
+        df_clean = df_clean[(df_clean["z"] > 0.15) & (df_clean["z"] < 0.22)].copy()
+
+    # Pass mask_lines=True to get the masked test_loader
+    _, _, test_loader, _ = prepare_agn_data(
         df_clean,
         batch_size=config["training"]["batch_size"],
         random_state=seed,
+        mask_lines=True
     )
 
+    print("Loading Pretrained SpectraNet Backbone...")
     model = SpectraNet(config).to(device)
-
-    criterion_class = BinaryFocalLossWithLogits(
-        alpha=focal_alpha,
-        gamma=focal_gamma,
-    )
-
-    criterion_redshift = nn.HuberLoss()
-
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=float(config["training"]["learning_rate"]),
-        weight_decay=float(config["training"]["weight_decay"]),
-    )
-
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=0.5,
-        patience=5,
-    )
-
-    history = {
-        "train_loss": [],
-        "train_f1": [],
-        "val_loss": [],
-        "val_f1": [],
-    }
-
-    best_val_f1 = -1.0
-    best_epoch = -1
-
-    run_dir = os.path.join(models_dir, run_name)
-    os.makedirs(run_dir, exist_ok=True)
-
-    model_save_path = os.path.join(run_dir, "best_spectranet.pth")
-
-    for epoch in range(config["training"]["num_epochs"]):
-        p = epoch / config["training"]["num_epochs"]
-        dann_alpha = 2.0 / (1.0 + np.exp(-10 * p)) - 1.0
-
-        warmup_epochs = 5
-        max_lambda = 0.0
-
-        if epoch < warmup_epochs:
-            current_lambda_z = 0.0
-        else:
-            current_lambda_z = max_lambda * dann_alpha
-
-        t_loss, t_f1 = train_one_epoch(
-            model,
-            train_loader,
-            criterion_class,
-            criterion_redshift,
-            optimizer,
-            device,
-            dann_alpha,
-            current_lambda_z,
-        )
-
-        v_loss, v_f1 = validate_one_epoch(
-            model,
-            val_loader,
-            criterion_class,
-            device,
-        )
-
-        # Save by validation macro F1, not focal loss.
-        if v_f1 > best_val_f1:
-            best_val_f1 = v_f1
-            best_epoch = epoch + 1
-            torch.save(model.state_dict(), model_save_path)
-
-        scheduler.step(v_f1)
-
-        history["train_loss"].append(t_loss)
-        history["train_f1"].append(t_f1)
-        history["val_loss"].append(v_loss)
-        history["val_f1"].append(v_f1)
-
-        print(
-            f"Epoch {epoch + 1:03d} | "
-            f"Train F1: {t_f1:.4f} | "
-            f"Val F1: {v_f1:.4f} | "
-            f"Val Loss: {v_loss:.5f} | "
-            f"Best Val F1: {best_val_f1:.4f}"
-        )
-
-    # Plot training history for this run
-    epochs_range = range(1, config["training"]["num_epochs"] + 1)
-
-    plt.figure(figsize=(14, 5))
-
-    plt.subplot(1, 2, 1)
-    plt.plot(epochs_range, history["train_loss"], label="Training Loss", lw=2)
-    plt.plot(epochs_range, history["val_loss"], label="Validation Loss", linestyle="--", lw=2)
-    plt.title(f"Loss: {run_name}")
-    plt.xlabel("Epochs")
-    plt.ylabel("Loss")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-
-    plt.subplot(1, 2, 2)
-    plt.plot(epochs_range, history["train_f1"], label="Training F1", lw=2)
-    plt.plot(epochs_range, history["val_f1"], label="Validation F1", linestyle="--", lw=2)
-    plt.title(f"Macro F1: {run_name}")
-    plt.xlabel("Epochs")
-    plt.ylabel("Macro F1")
-    plt.ylim(0, 1)
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(run_dir, "training_history.png"), dpi=300)
-    plt.close()
-
-    # Load best checkpoint and evaluate
+    model_save_path = os.path.join(models_dir, 'best_spectranet.pth')
     model.load_state_dict(torch.load(model_save_path, map_location=device))
     model.eval()
 
-    val_metrics = evaluate_model(
-        model=model,
-        dataloader=val_loader,
-        device=device,
-        title=f"Validation best checkpoint: {run_name}",
-        save_cm_path=os.path.join(run_dir, "val_cm.png"),
-    )
+    save_cm_path = os.path.join(models_dir, "masked_backbone_cm.png")
 
-    test_metrics = evaluate_model(
+    masked_metrics = evaluate_model(
         model=model,
         dataloader=test_loader,
         device=device,
-        title=f"Test best checkpoint: {run_name}",
-        save_cm_path=os.path.join(run_dir, "test_cm.png"),
+        title="Masked Test best checkpoint: Backbone",
+        save_cm_path=save_cm_path,
     )
 
-    result = {
-        "run_name": run_name,
-        "seed": seed,
-        "focal_alpha": focal_alpha,
-        "focal_gamma": focal_gamma,
-        "best_epoch": best_epoch,
-        "best_val_f1_during_training": float(best_val_f1),
-        "val_metrics": val_metrics,
-        "test_metrics": test_metrics,
-        "model_path": model_save_path,
-    }
-
-    with open(os.path.join(run_dir, "result.json"), "w") as f:
-        json.dump(result, f, indent=4)
-
-    return result
-
+    print("\nMasked Backbone Metrics:")
+    for k, v in masked_metrics.items():
+        if k != "confusion_matrix":
+            print(f"{k}: {v:.4f}")
 
 def train_model():
     # Main setup
@@ -666,3 +489,4 @@ def train_model():
 
 if __name__ == "__main__":
     train_model()
+    evaluate_masked_backbone()

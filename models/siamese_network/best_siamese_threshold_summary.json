@@ -1,0 +1,29 @@
+{
+    "best_epoch": 24,
+    "best_threshold": 0.81,
+    "best_threshold_metrics": {
+        "threshold": 0.81,
+        "tp": 145,
+        "fp": 0,
+        "tn": 9804,
+        "fn": 51,
+        "precision_change": 1.0,
+        "recall_change": 0.7397959183673469,
+        "fbeta": 0.9342783505154639,
+        "false_positive_rate": 0.0,
+        "false_negative_rate": 0.26020408161937736,
+        "num_predicted_positive": 145,
+        "predicted_positive_fraction": 0.0145,
+        "used_fallback": false
+    },
+    "best_score": {
+        "fbeta": 0.9342783505154639,
+        "precision_change": 1.0,
+        "negative_fpr": -0.0,
+        "fpr": 0.0,
+        "recall_change": 0.7397959183673469
+    },
+    "min_recall": 0.5,
+    "max_fpr": 0.05,
+    "model_path": "/Users/amir/Documents/Deep learning/cl-agn classifier/models/siamese_network/best_siamese_net.pth"
+}
