@@ -294,7 +294,8 @@ def evaluate_masked_siamese():
         epoch_size=10000, 
         mode='test',
         change_pair_prob=eval_change_pair_prob,
-        mask_lines=True
+        mask_lines=True,
+        apply_masking=False
     )
     masked_test_loader = DataLoader(masked_test_dataset, batch_size=config['siamese_training']['batch_size'], shuffle=False)
 
@@ -308,7 +309,7 @@ def evaluate_masked_siamese():
             all_masked_preds.extend(preds.cpu().numpy().flatten())
             all_masked_targets.extend(batch_y.cpu().numpy().flatten())
 
-    cm_masked = confusion_matrix(all_masked_targets, all_masked_preds)
+    cm_masked = confusion_matrix(all_masked_targets, all_masked_preds,labels=[0,1])
     tn, fp, fn, tp = cm_masked.ravel()
     
     # Plot Confusion Matrix
@@ -355,9 +356,6 @@ def train_siamese():
     eval_change_pair_prob = float(
         config["siamese_training"].get("eval_change_pair_prob", 0.02)
     )
-
-
-
     # 2. Data
     df_clean = pd.read_parquet(os.path.join(BASE_DIR, config['data']['processed_catalog']))
     df_clean = df_clean.sort_values('snr', ascending=False).drop_duplicates(subset=['obj_id'])
@@ -378,6 +376,8 @@ def train_siamese():
         flux_cols, 
         epoch_size=20000, 
         mode = 'train',
+        mask_lines= False,
+        apply_masking= True,
         change_pair_prob=train_change_pair_prob
     )
     val_dataset = SyntheticSiameseDataset(
@@ -385,6 +385,8 @@ def train_siamese():
         flux_cols, 
         epoch_size=10000, 
         mode = 'val',
+        mask_lines= False,
+        apply_masking= False,
         change_pair_prob=eval_change_pair_prob
     )
     test_dataset = SyntheticSiameseDataset(
@@ -392,6 +394,8 @@ def train_siamese():
         flux_cols, 
         epoch_size=10000, 
         mode = 'test',
+        mask_lines= False,
+        apply_masking= False,
         change_pair_prob=eval_change_pair_prob
     )
 
@@ -414,7 +418,15 @@ def train_siamese():
                             lr=float(config['siamese_training']['learning_rate']), 
                             weight_decay=float(config['siamese_training']['weight_decay']))
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5) 
-    history = {'train_loss': [], 'train_f1': [], 'val_loss': [], 'val_f1': []}
+    history = {
+    'train_loss': [],
+    'val_loss': [],
+    'val_fbeta': [],
+    'val_precision': [],
+    'val_recall': [],
+    'val_fpr': [],
+    'val_threshold': [],
+}
     best_score = (-1.0, -1.0, -1.0,-1.0)
     best_threshold = None
     best_threshold_metrics = None
@@ -448,17 +460,20 @@ def train_siamese():
 
         # Track history
         history['train_loss'].append(t_loss)
-        history['train_f1'].append(t_f1)
         history['val_loss'].append(v_loss)
-        history['val_f1'].append(v_f1)
+        history['val_fbeta'].append(best_epoch_threshold["fbeta"])
+        history['val_precision'].append(best_epoch_threshold["precision_change"])
+        history['val_recall'].append(best_epoch_threshold["recall_change"])
+        history['val_fpr'].append(best_epoch_threshold["false_positive_rate"])
+        history['val_threshold'].append(best_epoch_threshold["threshold"])
 
         scheduler_score = best_epoch_threshold["fbeta"]
         scheduler.step(scheduler_score)
         
         print(
         f"Epoch {epoch+1}/{config['siamese_training']['num_epochs']} | "
-        f"Train Loss: {t_loss:.4f} | Train F1: {t_f1:.4f} | "
-        f"Val Loss: {v_loss:.4f} | Val F1: {v_f1:.4f} | "
+        f"Train Loss: {t_loss:.4f} | "
+        f"Val Loss: {v_loss:.4f} | "
         f"Thr: {best_epoch_threshold['threshold']:.2f} | "
         f"Selected: {best_epoch_threshold['num_predicted_positive']} "
         f"({100 * best_epoch_threshold['predicted_positive_fraction']:.2f}%) | "
@@ -468,7 +483,6 @@ def train_siamese():
         f"F0.5: {best_epoch_threshold['fbeta']:.4f} | "
         f"TP/FP: {best_epoch_threshold['tp']}/{best_epoch_threshold['fp']}"
         )
-
         if current_score > best_score:
             best_score = current_score
             best_threshold = best_epoch_threshold["threshold"]
@@ -505,44 +519,73 @@ def train_siamese():
                 json.dump(summary, f, indent=4)
                     
             print(
-                f"[Epoch {epoch+1}] New best model saved! "
-                f"Precision={best_score[0]:.4f}, "
-                f"FPR={-best_score[1]:.4f}, "
-                f"Recall={best_score[2]:.4f}, "
-                f"F0.5={best_score[3]:.4f}, "
-                f"threshold={best_threshold:.2f}, "
-                f"max_fpr={max_fpr:.4f}"
+                f"[Epoch {epoch+1}] Saved best | "
+                f"F0.5={best_score[0]:.4f}, "
+                f"Prec={best_score[1]:.4f}, "
+                f"FPR={-best_score[2]:.4f}, "
+                f"Rec={best_score[3]:.4f}, "
+                f"Thr={best_threshold:.2f}"
                 )
     # ======================== POST-TRAINING VISUALIZATION ========================
     print("\n=== Generating post-training plots ===")
 
-    # ---------- 1. Loss & F1 Macro Score vs Epochs ----------
+    # ---------- 1. Loss vs Epochs ----------
     epochs_range = range(1, len(history['train_loss']) + 1)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    fig, ax = plt.subplots(figsize=(8, 6))
 
-    # Loss subplot
-    ax1.plot(epochs_range, history['train_loss'], label='Train Loss', linewidth=2)
-    ax1.plot(epochs_range, history['val_loss'], label='Val Loss', linewidth=2)
-    ax1.set_xlabel('Epoch', fontsize=13)
-    ax1.set_ylabel('Loss', fontsize=13)
-    ax1.set_title('Siamese Network — Loss vs Epochs', fontsize=14, fontweight='bold')
-    ax1.legend(fontsize=12)
-    ax1.grid(True, linestyle='--', alpha=0.5)
+    ax.plot(epochs_range, history['train_loss'], label='Train Loss', linewidth=2)
+    ax.plot(epochs_range, history['val_loss'], label='Val Loss', linewidth=2)
 
-    # F1 subplot
-    ax2.plot(epochs_range, history['train_f1'], label='Train F1 (macro)', linewidth=2)
-    ax2.plot(epochs_range, history['val_f1'], label='Val F1 (macro)', linewidth=2)
-    ax2.set_xlabel('Epoch', fontsize=13)
-    ax2.set_ylabel('F1 Macro', fontsize=13)
-    ax2.set_title('Siamese Network — F1 Macro vs Epochs', fontsize=14, fontweight='bold')
-    ax2.legend(fontsize=12)
-    ax2.grid(True, linestyle='--', alpha=0.5)
+    ax.set_xlabel('Epoch', fontsize=13)
+    ax.set_ylabel('Loss', fontsize=13)
+    ax.set_title('Siamese Network — Loss vs Epochs', fontsize=14, fontweight='bold')
+    ax.legend(fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.5)
 
     plt.tight_layout()
-    loss_f1_path = os.path.join(models_dir, 'siamese_loss_f1_curves.png')
-    plt.savefig(loss_f1_path, dpi=300)
-    print(f"Saved loss/F1 curves to {loss_f1_path}")
+    loss_path = os.path.join(models_dir, 'siamese_loss_curves.png')
+    plt.savefig(loss_path, dpi=300)
+    print(f"Saved loss curves to {loss_path}")
+    plt.show()
+
+
+    # ---------- 2. Validation precision / recall / F0.5 vs Epochs ----------
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    ax.plot(epochs_range, history['val_fbeta'], label='Val F0.5', linewidth=2)
+    ax.plot(epochs_range, history['val_precision'], label='Val Precision(change)', linewidth=2)
+    ax.plot(epochs_range, history['val_recall'], label='Val Recall(change)', linewidth=2)
+
+    ax.set_xlabel('Epoch', fontsize=13)
+    ax.set_ylabel('Metric value', fontsize=13)
+    ax.set_title('Siamese Network — Validation Change-Class Metrics', fontsize=14, fontweight='bold')
+    ax.legend(fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.5)
+
+    plt.tight_layout()
+    selection_path = os.path.join(models_dir, 'siamese_validation_selection_metrics.png')
+    plt.savefig(selection_path, dpi=300)
+    print(f"Saved validation selection metrics to {selection_path}")
+    plt.show()
+
+
+    # ---------- 3. Validation FPR and selected threshold vs Epochs ----------
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    ax.plot(epochs_range, history['val_fpr'], label='Val FPR', linewidth=2)
+    ax.plot(epochs_range, history['val_threshold'], label='Selected Threshold', linewidth=2)
+
+    ax.set_xlabel('Epoch', fontsize=13)
+    ax.set_ylabel('Value', fontsize=13)
+    ax.set_title('Siamese Network — FPR and Selected Threshold', fontsize=14, fontweight='bold')
+    ax.legend(fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.5)
+
+    plt.tight_layout()
+    fpr_threshold_path = os.path.join(models_dir, 'siamese_fpr_threshold_curves.png')
+    plt.savefig(fpr_threshold_path, dpi=300)
+    print(f"Saved FPR/threshold curves to {fpr_threshold_path}")
     plt.show()
 
     # ---------- 2. Confusion Matrix on Test Set ----------
@@ -567,7 +610,7 @@ def train_siamese():
             all_test_preds.extend(preds.cpu().numpy().flatten())
             all_test_targets.extend(batch_y.cpu().numpy().flatten())
 
-    cm = confusion_matrix(all_test_targets, all_test_preds)
+    cm = confusion_matrix(all_test_targets, all_test_preds,labels=[0,1])
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Static (0)', 'Change (1)'])
     fig, ax = plt.subplots(figsize=(8, 7))
     disp.plot(ax=ax, cmap='Blues', values_format='d')
@@ -694,5 +737,5 @@ def train_siamese():
     print("\n=== All post-training visualizations complete ===")
 
 if __name__ == "__main__":
-    evaluate_masked_siamese()
-    #train_siamese()
+    #evaluate_masked_siamese()
+    train_siamese()

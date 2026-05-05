@@ -383,6 +383,7 @@ class SyntheticSiameseDataset(Dataset):
         mode="train",
         change_pair_prob=0.15,
         mask_lines=False,
+        apply_masking=False,
     ):
         """
         Dynamically generates Siamese pairs.
@@ -395,27 +396,37 @@ class SyntheticSiameseDataset(Dataset):
             Type 1 + Type 2
             or Type 2 + Type 1
 
-        Args:
-            df:
-                DataFrame containing spectra and metadata.
+        Parameters
+        ----------
+        df:
+            DataFrame containing spectra and metadata.
 
-            flux_cols:
-                List of wavelength/flux columns.
+        flux_cols:
+            List of wavelength/flux columns.
 
-            epoch_size:
-                Number of generated pairs per epoch.
+        epoch_size:
+            Number of generated pairs per epoch.
 
-            k_neighbors:
-                For train mode, choose randomly from nearest k matched objects.
+        k_neighbors:
+            For train mode, choose randomly from nearest k matched objects.
 
-            mode:
-                "train" -> random neighbor among nearest k
-                "val" / "test" -> deterministic nearest neighbor
+        mode:
+            "train" -> random neighbor among nearest k
+            "val" / "test" -> deterministic nearest neighbor
 
-            change_pair_prob:
-                Probability of generating a change-like pair.
-                Example:
-                    0.15 means 15% change-like, 85% static-like.
+        change_pair_prob:
+            Probability of generating a change-like pair.
+            Example:
+                0.15 means 15% change-like, 85% static-like.
+
+        mask_lines:
+            Deterministic aggressive shortcut-learning ablation.
+            Uses the same algorithm and wavelength regions as AGNSpectraDataset.
+
+        apply_masking:
+            Optional training-time augmentation.
+            Uses the same broad-line random masking logic as AGNSpectraDataset.
+            Usually True only for Siamese training, False for val/test.
         """
         self.df = df.reset_index(drop=True)
         self.flux_cols = flux_cols
@@ -424,8 +435,12 @@ class SyntheticSiameseDataset(Dataset):
         self.mode = mode
         self.change_pair_prob = change_pair_prob
         self.mask_lines = mask_lines
-        self.mask_ranges = [(4800, 5100), (6500, 6650), (4575, 4800)]
-        self.wavelengths = np.array(self.flux_cols).astype(float)
+        self.apply_masking = apply_masking
+
+        self.wavelengths = torch.tensor(
+            np.array(self.flux_cols).astype(float),
+            dtype=torch.float32,
+        )
 
         if self.mode not in ["train", "val", "test"]:
             raise ValueError(f"mode must be 'train', 'val', or 'test', got {mode}")
@@ -449,16 +464,158 @@ class SyntheticSiameseDataset(Dataset):
         self.z_std = self.df["z"].std() + 1e-8
         self.snr_std = self.df["snr"].std() + 1e-8
 
+        # ------------------------------------------------------------
+        # Same training augmentation regions as AGNSpectraDataset
+        # ------------------------------------------------------------
+        self.augmentation_line_regions = [
+            ("Hb_broad", 4700.0, 5000.0),
+            ("Ha_broad", 6350.0, 6699.0),
+        ]
+
+        self.augmentation_min_frac = 0.10
+        self.augmentation_max_frac = 0.60
+        self.augmentation_prob = 1.0
+
+        self.use_extra_random_mask = True
+        self.extra_random_mask_prob = 0.30
+        self.extra_random_mask_len_range = (20, 60)
+
+        # ------------------------------------------------------------
+        # Same aggressive shortcut-learning regions as AGNSpectraDataset
+        # ------------------------------------------------------------
+        self.aggressive_mask_regions = [
+            (4575.0, 5550.0),  # Hβ + [O III] + Fe II / blue diagnostic region
+            (5800.0, 5950.0),  # He I 5876 region
+            (6200.0, 6699.0),  # [O I] + Hα + [N II] / red diagnostic region
+        ]
+
     def __len__(self):
         return self.epoch_size
 
+    def _mask_wavelength_range(self, x, start_wave, end_wave):
+        """
+        Mask a wavelength interval by setting it to zero.
+        Same logic as AGNSpectraDataset.
+        """
+        mask = (self.wavelengths >= start_wave) & (self.wavelengths <= end_wave)
+        x[..., mask] = 0.0
+        return x
+
+    def _apply_random_broad_line_mask(self, x):
+        """
+        Training-time augmentation.
+
+        Choose one broad-line-sensitive region, then mask a random
+        contiguous sub-window inside that region.
+
+        Same logic as AGNSpectraDataset.
+        """
+        if torch.rand(1).item() > self.augmentation_prob:
+            return x
+
+        region_idx = torch.randint(
+            low=0,
+            high=len(self.augmentation_line_regions),
+            size=(1,),
+        ).item()
+
+        _, region_start, region_end = self.augmentation_line_regions[region_idx]
+
+        region_mask = (
+            (self.wavelengths >= region_start)
+            & (self.wavelengths <= region_end)
+        )
+
+        valid_idx = torch.where(region_mask)[0]
+
+        if valid_idx.numel() < 2:
+            return x
+
+        min_len = max(2, int(self.augmentation_min_frac * valid_idx.numel()))
+        max_len = max(min_len, int(self.augmentation_max_frac * valid_idx.numel()))
+
+        mask_len = torch.randint(
+            low=min_len,
+            high=max_len + 1,
+            size=(1,),
+        ).item()
+
+        max_start = valid_idx.numel() - mask_len
+        if max_start < 0:
+            return x
+
+        start_pos = torch.randint(
+            low=0,
+            high=max_start + 1,
+            size=(1,),
+        ).item()
+
+        selected_idx = valid_idx[start_pos:start_pos + mask_len]
+        x[..., selected_idx] = 0.0
+
+        return x
+
+    def _apply_extra_random_mask(self, x):
+        """
+        Optional small random local mask.
+        Same logic as AGNSpectraDataset.
+        """
+        if torch.rand(1).item() > self.extra_random_mask_prob:
+            return x
+
+        seq_len = x.shape[-1]
+        min_len, max_len = self.extra_random_mask_len_range
+
+        if seq_len <= min_len:
+            return x
+
+        max_len = min(max_len, seq_len - 1)
+
+        mask_len = torch.randint(
+            low=min_len,
+            high=max_len + 1,
+            size=(1,),
+        ).item()
+
+        start_idx = torch.randint(
+            low=0,
+            high=seq_len - mask_len + 1,
+            size=(1,),
+        ).item()
+
+        x[..., start_idx:start_idx + mask_len] = 0.0
+
+        return x
+
+    def _apply_aggressive_line_ablation(self, x):
+        """
+        Deterministic shortcut-learning test.
+
+        Masks all major diagnostic regions.
+        Same logic as AGNSpectraDataset.
+        """
+        for start_wave, end_wave in self.aggressive_mask_regions:
+            x = self._mask_wavelength_range(x, start_wave, end_wave)
+
+        return x
+
     def get_spectrum(self, idx):
         x = self.df.loc[idx, self.flux_cols].values.astype(np.float32)
+        x = torch.tensor(x, dtype=torch.float32).unsqueeze(0)  # [1, SeqLen]
+
+        # Deterministic aggressive masking for shortcut-learning tests.
         if self.mask_lines:
-            for start_wave, end_wave in self.mask_ranges:
-                mask_idx = (self.wavelengths >= start_wave) & (self.wavelengths <= end_wave)
-                x[mask_idx] = 0.0
-        return torch.tensor(x).unsqueeze(0)  # [1, SeqLen]
+            x = self._apply_aggressive_line_ablation(x)
+
+        # Optional random training augmentation.
+        # Usually use only when mode == "train".
+        if self.apply_masking:
+            x = self._apply_random_broad_line_mask(x)
+
+            if self.use_extra_random_mask:
+                x = self._apply_extra_random_mask(x)
+
+        return x
 
     def find_matched_partner(self, anchor_idx, partner_type):
         anchor = self.df.loc[anchor_idx]
@@ -498,6 +655,7 @@ class SyntheticSiameseDataset(Dataset):
             chosen_position = np.argmin(dist)
 
         partner_idx = candidate_indices[chosen_position]
+
         return partner_idx
 
     def __getitem__(self, i):
