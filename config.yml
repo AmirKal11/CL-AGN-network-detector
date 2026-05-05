@@ -18,7 +18,7 @@ model:
   hidden_dims: [32, 64, 128, 256, 384]
   in_channels: 1
   sequence_length: 1024
-  model_path: '/Users/amir/Documents/Deep learning/cl-agn classifier/models/best_spectranet.pth'
+  model_path: '../models/selected_backbone/best_spectranet.pth'
 
 
 siamese_training:
