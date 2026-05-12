@@ -31,3 +31,12 @@ data/
 # OS-specific caches
 .DS_Store
 Thumbs.db
+
+# Exclude download_spectra script
+src/download_spectra.py
+
+# Exclude giant catalog files that exceed git limits
+cataloges/gal_line_dr7_v5_2.fit.gz
+
+# Exclude temporary output directories
+outputs/
