@@ -1,0 +1,90 @@
+# config_v2.yml -- configuration for the redesigned CL-AGN pipeline (v2).
+# All paths are relative to the project root.
+#
+# Grid: wide rest-frame 3000-10400 A, 4096 px (preprocessing_oiii.MASTER_GRID).
+# Out-of-coverage pixels are zero-filled + masked, so every redshift is usable
+# and there is no z < 0.4 restriction. Regenerate the SSL parquets and the pair
+# cache after any grid change (see the run order in pretrain_ssl.py docstring).
+
+paths:
+  # Stage 1 (SSL) pool: one unified multi-survey parquet (SDSS-DR7 + DESI),
+  # built by data_preprocessing.build_unified_ssl_parquet(). SSLSpectraDataset
+  # still accepts a list, so extra parquets can be appended here later.
+  ssl_parquets:
+    - data/ssl_unified_dr7_desi_filtered.parquet
+    # Extension parquet -- 10k DR16 + 10k SDSS-V single-epoch spectra.
+    # Including this lets the encoder learn features from EVERY survey it
+    # sees at fine-tune time (closes the OOD gap on lowz / phase-2 pairs).
+    - data/ssl_dr16_sdssv_extension.parquet
+  # Stage 2: real same-object epoch pairs. ~468 CL-AGN positives
+  # (Paper-2 training portion + 70% of the lowz positives) plus ~16k
+  # negatives. Specnames are prefixed with their subdirectory so a single
+  # pair_spectra_dir can resolve both the SDSS-V x DR16 crossmatch and the
+  # Paper-2 (DESI x DR16) FITS.
+  pair_pickle: data/dr16_sdssv_phase2_train.pkl
+  pair_spectra_dir: data
+  # Held-out unseen test (used by the eval script, not by the trainer):
+  # 20 lowz positives, 30 Paper-2 positives, and ~350 z-matched negatives.
+  clagn_test_pickle: data/clagn_test.pkl
+  clagn_test_spectra_dir: data
+  # Outputs.
+  # Defaults to Phase A (the chosen model). The three trained models live side
+  # by side; to re-run or evaluate a different one, point these five paths at
+  # its directory:
+  #   baseline (DR7+DESI)         : models/clagn_v2_baseline
+  #   Phase A (full retrain 53k)  : models/clagn_v2_extended    <-- active (chosen model)
+  #   Phase B (continual+replay)  : models/clagn_v2_continual
+  out_dir: models/clagn_v2_extended
+  norm_stats: models/clagn_v2_extended/norm_stats.json
+  pair_cache: models/clagn_v2_extended/pair_arrays_cache.npz
+  ssl_checkpoint: models/clagn_v2_extended/ssl_encoder.pth
+  siamese_checkpoint: models/clagn_v2_extended/siamese_changenet.pth
+
+preprocessing:
+  oiii_snr_min: 4.0          # below this the [OIII] channel falls back to MAD
+
+ssl:                          # Stage 1 -- masked-reconstruction pretraining
+  batch_size: 128
+  num_epochs: 50
+  learning_rate: 3.0e-4
+  weight_decay: 1.0e-4
+  mask_ratio: 0.5             # fraction of the COVERED region blanked per sample
+  min_span: 64               # span sizes scaled x4 for the 4096-px wide grid
+  max_span: 384              # (were 16 / 96 on the old 1024-px grid)
+  val_frac: 0.05
+  max_rows: null             # cap the SSL pool (null = use everything)
+  num_workers: 0             # data is in-memory; workers would just copy it
+  seed: 42
+
+siamese:                      # Stage 2 -- change detector on real pairs
+  batch_size: 64
+  num_epochs: 40
+  encoder_lr: 1.0e-4         # ignored when encoder_freeze is true
+  head_lr: 1.0e-3           # higher LR for the fresh change head
+  weight_decay: 1.0e-4
+  dropout: 0.4
+  focal_alpha: 0.5
+  focal_gamma: 2.0
+  synthetic_prob: 0.0        # 0 = real-pairs only (no make_synthetic_change)
+  encoder_freeze: true       # linear-probe regime: keep SSL features fixed,
+                             # train only the change head. Fits the 468-pos
+                             # training pool while preventing fine-tune
+                             # gradients from amplifying survey-pair signals.
+  sampler_pos_rate: 0.2      # WeightedRandomSampler target positive rate
+                             # per batch. 0.2 -> ~13 pos / 51 neg per
+                             # batch=64. Set 0.0 to disable.
+  val_frac: 0.15
+  test_frac: 0.0             # no internal test -- clagn_test.pkl is the held-out test
+  decision_threshold: 0.5    # only used by downstream scripts; the trainer
+                             # ignores this and picks its own threshold via
+                             # the F-beta sweep below.
+  # ---- F-beta threshold sweep (mirrors train_siamese.py / v1) ---------
+  # Each epoch the chosen threshold is the one that:
+  #   1. has recall >= min_recall  AND  fpr <= max_fpr
+  #   2. among survivors, maximises (fbeta, precision, -fpr, recall)
+  # If no threshold passes step 1, fall back to argmax fbeta and flag it.
+  fbeta_beta: 0.5            # 0.5 weights precision 2x over recall
+  min_recall: 0.10           # at least 10% TPR required
+  max_fpr:    0.01           # at most 1% FPR allowed
+  num_workers: 0             # pairs are preprocessed once into RAM
+  seed: 42

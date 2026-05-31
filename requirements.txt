@@ -1,0 +1,17 @@
+# Core ML / numerics
+torch>=2.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.2.0
+matplotlib>=3.7.0
+
+# Spectra I/O and signal processing
+astropy>=5.2          # FITS reading, sky coordinates
+scipy>=1.10           # interpolation / signal processing in preprocessing
+pyarrow>=12.0         # parquet engine for the SSL pools (pandas read/to_parquet)
+
+# Data-prep / download utilities
+joblib>=1.2           # parallel preprocessing in build_ssl_extension_parquet
+tqdm>=4.65            # download progress bars
+requests>=2.28        # SDSS / DESI FITS downloads
+pyyaml>=6.0           # config_v2.yml

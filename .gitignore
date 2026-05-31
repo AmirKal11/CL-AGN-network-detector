@@ -1,0 +1,24 @@
+# Data (large; sourced from public SDSS / DESI archives — not committed)
+data/
+
+# Regenerable preprocessing caches and any large arrays
+*.npz
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+env/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model checkpoints / eval artifacts are intentionally committed (lightweight),
+# but exclude any stray large encoder/optimizer dumps if added later:
+# models/**/optimizer_*.pth

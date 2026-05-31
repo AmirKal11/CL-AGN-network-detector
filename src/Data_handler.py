@@ -1,0 +1,815 @@
+import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+from utils import load_config
+import os
+import random
+import torch.nn.functional as F
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _is_wavelength_col(col_name):
+    """Check if a column name looks like a wavelength value (i.e. a float)."""
+    try:
+        float(col_name)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def get_spectrum_limits(df):
+    flux_cols = [c for c in df.columns if _is_wavelength_col(c)]
+    wavelengths = np.array(flux_cols).astype(float)
+
+    # Identify which pixels are NEVER zero across the whole dataset
+    # (We check for != 0.0 across all rows)
+    is_never_zero = (df[flux_cols] != 0.0).all(axis=0)
+
+    # The 'Safe Box' is the range where this mask is True
+    safe_wavelengths = wavelengths[is_never_zero]
+    blue_limit = safe_wavelengths.min()
+    red_limit = safe_wavelengths.max()
+
+    print(f"--- Safe Overlap Analysis ---")
+    print(f"Safe Blue Limit: {blue_limit:.1f} Å")
+    print(f"Safe Red Limit:  {red_limit:.1f} Å")
+    print(f"Total valid range: {red_limit - blue_limit:.1f} Å")
+    return blue_limit, red_limit
+
+
+def get_spectrum(df, identifier):
+    """
+    Retrieves the wavelength grid and flux array for a specific spectrum.
+    
+    Parameters:
+    df (pd.DataFrame): The processed AGN catalog.
+    identifier (int or str): The row index (int) or the filename (str).
+    
+    Returns:
+    tuple: (wavelengths, flux, metadata)
+    """
+    # Identify flux columns as those whose names are valid wavelength floats
+    flux_cols = [c for c in df.columns if _is_wavelength_col(c)]
+    
+    # 1. Locate the row
+    if isinstance(identifier, (int, np.integer)):
+        row = df.iloc[identifier]
+    elif isinstance(identifier, str):
+        match = df[df['filename'] == identifier]
+        if match.empty:
+            raise ValueError(f"Filename '{identifier}' not found in DataFrame.")
+        row = match.iloc[0]
+    else:
+        raise TypeError("Identifier must be an integer (row index) or string (filename).")
+    
+    # 2. Extract data
+    wavelengths = np.array(flux_cols).astype(float)
+    flux = row[flux_cols].values.astype(np.float32)
+    meta_cols = [c for c in df.columns if not _is_wavelength_col(c)]
+    metadata = row[meta_cols].to_dict()
+    
+    return wavelengths, flux, metadata
+
+def prepare_for_nn(df_clean):
+    """
+    Prepares the cleaned DataFrame for a neural network.
+    Returns X (reshaped for PyTorch 1D CNNs) and y (binary labels).
+    """
+    flux_cols = [c for c in df_clean.columns if _is_wavelength_col(c)]
+    
+
+    X = df_clean[flux_cols].values
+    # Add channel dimension: (Samples, Channels, Sequence_Length)
+    # This creates shape (N, 1, 5001)
+    X = np.expand_dims(X, axis=1)
+    
+    # Encode Type 1 -> 0, Type 2 -> 1
+    y = (df_clean['agn_type'] == 2).astype(int).values
+    
+    z = df_clean['z'].values
+    
+
+    # Randomly shuffle the entire dataset
+    indices = np.random.permutation(len(X))
+    X = X[indices]
+    y = y[indices]
+    z = z[indices]
+    
+    z_mean = np.mean(z)
+    z_std = np.std(z)
+    z_scaled = (z - z_mean) / (z_std + 1e-6)
+    
+
+    return X, y, z_scaled
+    
+class AGNSpectraDataset(Dataset):
+    def __init__(
+        self,
+        X,
+        y,
+        wavelengths=None,
+        z=None,
+        apply_masking=False,
+        mask_lines=False,
+    ):
+        """
+        Dataset for AGN spectra.
+
+        Parameters
+        ----------
+        X : array-like
+            Spectra array with shape [N, 1, L].
+
+        y : array-like
+            Binary labels.
+            Type 1 -> 0
+            Type 2 -> 1
+
+        wavelengths : array-like
+            Rest-frame wavelength grid with shape [L].
+
+        z : array-like
+            Redshift values, usually scaled before being passed here.
+
+        apply_masking : bool
+            Training-time random augmentation.
+            Masks a random sub-window inside one broad-line-sensitive region.
+
+        mask_lines : bool
+            Deterministic aggressive shortcut-learning ablation.
+            Masks all major diagnostic regions.
+        """
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32).view(-1, 1)
+
+        if z is None:
+            raise ValueError("Redshift (z) must be provided for adversarial training.")
+        self.z = torch.tensor(z, dtype=torch.float32).view(-1, 1)
+
+        self.apply_masking = apply_masking
+        self.mask_lines = mask_lines
+
+        if wavelengths is None:
+            self.wavelengths = None
+        else:
+            self.wavelengths = torch.tensor(wavelengths, dtype=torch.float32)
+
+        # ------------------------------------------------------------
+        # 1. Training augmentation regions
+        # ------------------------------------------------------------
+        # These are NOT meant to erase all diagnostics.
+        # They randomly remove part of broad-line-sensitive regions
+        # to improve robustness and reduce dependence on one exact feature.
+        #
+        # Narrow forbidden lines are intentionally not targeted here,
+        # because they are relatively consistent in both classes.
+        self.augmentation_line_regions = [
+            ("Hb_broad", 4700.0, 5000.0),
+            ("Ha_broad", 6350.0, 6699.0),
+        ]
+
+        # Fraction of the selected broad-line region to mask.
+        # Example: if the selected region contains 150 pixels,
+        # mask between 15 and 90 pixels.
+        self.augmentation_min_frac = 0.05
+        self.augmentation_max_frac = 0.30
+
+        # Probability of applying the broad-line augmentation.
+        # Since this dataset only uses apply_masking=True for train,
+        # you can keep this at 1.0, or lower it to 0.5–0.8 if too aggressive.
+        self.augmentation_prob = 0.6
+
+        # Optional extra random local mask, similar to SpecAugment.
+        # Keep this small. It should improve robustness, not destroy spectra.
+        self.use_extra_random_mask = True
+        self.extra_random_mask_prob = 0.30
+        self.extra_random_mask_len_range = (20, 60)
+
+        # ------------------------------------------------------------
+        # 2. Aggressive shortcut-learning ablation regions
+        # ------------------------------------------------------------
+        # These are deliberately broad and deterministic.
+        # They are for testing whether the model can still classify
+        # after the main diagnostic regions are removed.
+        self.aggressive_mask_regions = [
+            (4575.0, 5550.0),  # Hβ + [O III] + Fe II / blue diagnostic region
+            (5800.0, 5950.0),  # He I 5876 region
+            (6200.0, 6699.0),  # [O I] + Hα + [N II] / red diagnostic region
+        ]
+
+    def __len__(self):
+        return len(self.X)
+
+    def _mask_wavelength_range(self, x, start_wave, end_wave):
+        """
+        Mask a wavelength interval by setting it to zero.
+        """
+        if self.wavelengths is None:
+            return x
+
+        mask = (self.wavelengths >= start_wave) & (self.wavelengths <= end_wave)
+        x[..., mask] = 0.0
+        return x
+
+    def _apply_random_broad_line_mask(self, x):
+        """
+        Training-time augmentation.
+
+        Choose one broad-line-sensitive region, then mask a random
+        contiguous sub-window inside that region.
+
+        This is intentionally milder than the aggressive shortcut test.
+        """
+        if self.wavelengths is None:
+            return x
+
+        if torch.rand(1).item() > self.augmentation_prob:
+            return x
+
+        # Choose Hb or Ha region randomly.
+        region_idx = torch.randint(
+            low=0,
+            high=len(self.augmentation_line_regions),
+            size=(1,),
+        ).item()
+
+        _, region_start, region_end = self.augmentation_line_regions[region_idx]
+
+        region_mask = (
+            (self.wavelengths >= region_start)
+            & (self.wavelengths <= region_end)
+        )
+        valid_idx = torch.where(region_mask)[0]
+
+        if valid_idx.numel() < 2:
+            return x
+
+        min_len = max(2, int(self.augmentation_min_frac * valid_idx.numel()))
+        max_len = max(min_len, int(self.augmentation_max_frac * valid_idx.numel()))
+
+        # torch.randint high is exclusive, so use max_len + 1.
+        mask_len = torch.randint(
+            low=min_len,
+            high=max_len + 1,
+            size=(1,),
+        ).item()
+
+        max_start = valid_idx.numel() - mask_len
+        if max_start < 0:
+            return x
+
+        start_pos = torch.randint(
+            low=0,
+            high=max_start + 1,
+            size=(1,),
+        ).item()
+
+        selected_idx = valid_idx[start_pos:start_pos + mask_len]
+        x[..., selected_idx] = 0.0
+
+        return x
+
+    def _apply_extra_random_mask(self, x):
+        """
+        Optional small random local mask outside the physically targeted logic.
+        This is a mild robustness augmentation.
+        """
+        if torch.rand(1).item() > self.extra_random_mask_prob:
+            return x
+
+        seq_len = x.shape[-1]
+        min_len, max_len = self.extra_random_mask_len_range
+
+        if seq_len <= min_len:
+            return x
+
+        max_len = min(max_len, seq_len - 1)
+
+        mask_len = torch.randint(
+            low=min_len,
+            high=max_len + 1,
+            size=(1,),
+        ).item()
+
+        start_idx = torch.randint(
+            low=0,
+            high=seq_len - mask_len + 1,
+            size=(1,),
+        ).item()
+
+        x[..., start_idx:start_idx + mask_len] = 0.0
+        return x
+
+    def _apply_aggressive_line_ablation(self, x):
+        """
+        Deterministic shortcut-learning test.
+
+        Masks all major diagnostic regions. This should only be used for
+        ablation/evaluation, not normal training augmentation.
+        """
+        if self.wavelengths is None:
+            return x
+
+        for start_wave, end_wave in self.aggressive_mask_regions:
+            x = self._mask_wavelength_range(x, start_wave, end_wave)
+
+        return x
+    
+    def _apply_redshift_jitter(self, x, shift_max=7):
+        """
+        Randomly shifts the spectrum along the fixed wavelength grid
+        to simulate automated redshift pipeline discrepancies.
+        """
+        shift = random.randint(-shift_max, shift_max)
+        if shift != 0:
+            x = torch.roll(x, shifts=shift, dims=-1)
+            # Zero out wrap-around edge artifacts
+            if shift > 0:
+                x[..., :shift] = 0.0
+            else:
+                x[..., shift:] = 0.0
+        return x
+
+    def _apply_resolution_smearing(self, x, blur_prob=0.5):
+        """
+        Applies a mild 1D Gaussian smoothing filter to simulate 
+        instrumental profile differences between spectrographs.
+        """
+        if random.random() > blur_prob:
+            return x
+            
+        # x shape is [1, 1024]. F.conv1d requires a batch dim: [B, C, L]
+        x_padded = F.pad(x.unsqueeze(0), (2, 2), mode='reflect')
+        
+        kernel = torch.tensor([0.1, 0.2, 0.4, 0.2, 0.1], dtype=torch.float32, device=x.device).view(1, 1, 5)
+        x_smoothed = F.conv1d(x_padded, kernel)
+        
+        return x_smoothed.squeeze(0)
+
+    def __getitem__(self, idx):
+        x = self.X[idx].clone()
+        y = self.y[idx]
+        z = self.z[idx]
+
+        # Deterministic aggressive masking for shortcut-learning tests.
+        if self.mask_lines:
+            x = self._apply_aggressive_line_ablation(x)
+
+        # Random training augmentations
+        if self.apply_masking:
+            # 1. Your original broad line/random masks
+            x = self._apply_random_broad_line_mask(x)
+            if self.use_extra_random_mask:
+                x = self._apply_extra_random_mask(x)
+                
+            # 2. NEW: Domain shift defense augmentations
+            x = self._apply_redshift_jitter(x, shift_max=5)
+            x = self._apply_resolution_smearing(x, blur_prob=0.3)
+
+        return x, y, z
+
+        
+def prepare_agn_data(df, batch_size=256, random_state=42, mask_lines=False):
+    flux_cols = [c for c in df.columns if _is_wavelength_col(c)]
+    wavelengths = np.array(flux_cols).astype(float)
+    config = load_config(os.path.join(BASE_DIR, 'config.yml'))
+
+
+    X = df[flux_cols].values
+    X = np.expand_dims(X, axis=1) # (N, 1, 1024)
+    y = (df['agn_type'] == 2).astype(int).values # Binary Targets
+    
+    # --- NEW: Extract and Scale Redshift ---
+    z_raw = df['z'].values
+    z_mean, z_std = z_raw.mean(), z_raw.std()
+    z_scaled = (z_raw - z_mean) / (z_std + 1e-8)
+
+    # --- NEW: Synced Splitting (X, y, and z) ---
+    # Split 1: 70% Train, 30% Temp
+    X_train, X_temp, y_train, y_temp, z_train, z_temp = train_test_split(
+        X, y, z_scaled, test_size=0.30, random_state=random_state, stratify=y, shuffle=True
+    )
+
+    # Split 2: 15% Val, 15% Test
+    X_val, X_test, y_val, y_test, z_val, z_test = train_test_split(
+        X_temp, y_temp, z_temp, test_size=0.50, random_state=random_state, stratify=y_temp, shuffle=True
+    )
+
+    num_neg = (y_train == 0).sum()
+    num_pos = (y_train == 1).sum()
+    pos_weight = torch.tensor([num_neg / num_pos], dtype=torch.float32)
+
+    # --- NEW: Pass z to Datasets ---
+    train_ds = AGNSpectraDataset(X_train, y_train, z=z_train, wavelengths=wavelengths, apply_masking=True, mask_lines=mask_lines)
+    val_ds   = AGNSpectraDataset(X_val, y_val, z=z_val, wavelengths=wavelengths, apply_masking=False, mask_lines=mask_lines)
+    test_ds  = AGNSpectraDataset(X_test, y_test, z=z_test, wavelengths=wavelengths, apply_masking=False, mask_lines=mask_lines)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    
+    return train_loader, val_loader, test_loader, pos_weight
+
+
+def prepare_agn_data_4way(
+    df,
+    batch_size=256,
+    random_state=42,
+    mask_lines=False,
+    split_ratios=(0.70, 0.20, 0.05, 0.05),
+):
+    """
+    4-way stratified split: train / val / test / held-out noise.
+
+    Parameters
+    ----------
+    split_ratios : tuple of 4 floats
+        (train, val, test, held_out) fractions. Must sum to 1.0.
+
+    Returns
+    -------
+    train_loader, val_loader, test_loader, pos_weight, df_held_out
+        df_held_out is a raw DataFrame slice (not a DataLoader) so it can
+        be saved to parquet for later CL-AGN noise injection.
+    """
+    r_train, r_val, r_test, r_held = split_ratios
+    assert abs(sum(split_ratios) - 1.0) < 1e-6, f"Split ratios must sum to 1, got {sum(split_ratios)}"
+
+    flux_cols = [c for c in df.columns if _is_wavelength_col(c)]
+    wavelengths = np.array(flux_cols).astype(float)
+
+    X = df[flux_cols].values
+    X = np.expand_dims(X, axis=1)  # (N, 1, 1024)
+    y = (df["agn_type"] == 2).astype(int).values
+
+    z_raw = df["z"].values
+    z_mean, z_std = z_raw.mean(), z_raw.std()
+    z_scaled = (z_raw - z_mean) / (z_std + 1e-8)
+
+    indices = np.arange(len(X))
+
+    # Split 1: carve out held-out set first
+    idx_rest, idx_held, y_rest, y_held = train_test_split(
+        indices, y, test_size=r_held, random_state=random_state, stratify=y, shuffle=True,
+    )
+
+    # Split 2: from the remainder, carve out test set
+    # test fraction relative to remainder
+    r_test_rel = r_test / (r_train + r_val + r_test)
+    idx_trainval, idx_test, y_trainval, y_test_arr = train_test_split(
+        idx_rest, y_rest, test_size=r_test_rel, random_state=random_state, stratify=y_rest, shuffle=True,
+    )
+
+    # Split 3: from train+val, carve out val set
+    r_val_rel = r_val / (r_train + r_val)
+    idx_train, idx_val, y_train_arr, y_val_arr = train_test_split(
+        idx_trainval, y_trainval, test_size=r_val_rel, random_state=random_state, stratify=y_trainval, shuffle=True,
+    )
+
+    X_train, X_val, X_test = X[idx_train], X[idx_val], X[idx_test]
+    y_train, y_val, y_test = y[idx_train], y[idx_val], y[idx_test]
+    z_train, z_val, z_test = z_scaled[idx_train], z_scaled[idx_val], z_scaled[idx_test]
+
+    # Held-out set as a DataFrame (for saving to parquet)
+    df_held_out = df.iloc[idx_held].copy()
+
+    num_neg = (y_train == 0).sum()
+    num_pos = (y_train == 1).sum()
+    pos_weight = torch.tensor([num_neg / num_pos], dtype=torch.float32)
+
+    train_ds = AGNSpectraDataset(X_train, y_train, z=z_train, wavelengths=wavelengths, apply_masking=True, mask_lines=mask_lines)
+    val_ds   = AGNSpectraDataset(X_val, y_val, z=z_val, wavelengths=wavelengths, apply_masking=False, mask_lines=mask_lines)
+    test_ds  = AGNSpectraDataset(X_test, y_test, z=z_test, wavelengths=wavelengths, apply_masking=False, mask_lines=mask_lines)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+
+    print(f"Split sizes — Train: {len(idx_train)}  Val: {len(idx_val)}  "
+          f"Test: {len(idx_test)}  Held-out: {len(idx_held)}")
+
+    return train_loader, val_loader, test_loader, pos_weight, df_held_out
+
+class SyntheticSiameseDataset(Dataset):
+    def __init__(
+        self,
+        df,
+        flux_cols,
+        epoch_size=2000,
+        k_neighbors=20,
+        mode="train",
+        change_pair_prob=0.15,
+        mask_lines=False,
+        apply_masking=False,
+    ):
+        """
+        Dynamically generates Siamese pairs.
+
+        label 0 = static-like pair:
+            Type 1 + Type 1
+            or Type 2 + Type 2
+
+        label 1 = change-like pair:
+            Type 1 + Type 2
+            or Type 2 + Type 1
+
+        Parameters
+        ----------
+        df:
+            DataFrame containing spectra and metadata.
+
+        flux_cols:
+            List of wavelength/flux columns.
+
+        epoch_size:
+            Number of generated pairs per epoch.
+
+        k_neighbors:
+            For train mode, choose randomly from nearest k matched objects.
+
+        mode:
+            "train" -> random neighbor among nearest k
+            "val" / "test" -> deterministic nearest neighbor
+
+        change_pair_prob:
+            Probability of generating a change-like pair.
+            Example:
+                0.15 means 15% change-like, 85% static-like.
+
+        mask_lines:
+            Deterministic aggressive shortcut-learning ablation.
+            Uses the same algorithm and wavelength regions as AGNSpectraDataset.
+
+        apply_masking:
+            Optional training-time augmentation.
+            Uses the same broad-line random masking logic as AGNSpectraDataset.
+            Usually True only for Siamese training, False for val/test.
+        """
+        self.df = df.reset_index(drop=True)
+        self.flux_cols = flux_cols
+        self.epoch_size = epoch_size
+        self.k_neighbors = k_neighbors
+        self.mode = mode
+        self.change_pair_prob = change_pair_prob
+        self.mask_lines = mask_lines
+        self.apply_masking = apply_masking
+
+        self.wavelengths = torch.tensor(
+            np.array(self.flux_cols).astype(float),
+            dtype=torch.float32,
+        )
+
+        if self.mode not in ["train", "val", "test"]:
+            raise ValueError(f"mode must be 'train', 'val', or 'test', got {mode}")
+
+        if not (0.0 <= self.change_pair_prob <= 1.0):
+            raise ValueError(
+                f"change_pair_prob must be between 0 and 1, got {change_pair_prob}"
+            )
+
+        self.indices_by_type = {
+            1: self.df[self.df["agn_type"] == 1].index.values,
+            2: self.df[self.df["agn_type"] == 2].index.values,
+        }
+
+        if len(self.indices_by_type[1]) == 0:
+            raise ValueError("No Type 1 AGN found in dataframe.")
+
+        if len(self.indices_by_type[2]) == 0:
+            raise ValueError("No Type 2 AGN found in dataframe.")
+
+        self.z_std = self.df["z"].std() + 1e-8
+        self.snr_std = self.df["snr"].std() + 1e-8
+
+        # ------------------------------------------------------------
+        # Same training augmentation regions as AGNSpectraDataset
+        # ------------------------------------------------------------
+        self.augmentation_line_regions = [
+            ("Hb_broad", 4700.0, 5000.0),
+            ("Ha_broad", 6350.0, 6699.0),
+        ]
+
+        self.augmentation_min_frac = 0.10
+        self.augmentation_max_frac = 0.60
+        self.augmentation_prob = 1.0
+
+        self.use_extra_random_mask = True
+        self.extra_random_mask_prob = 0.30
+        self.extra_random_mask_len_range = (20, 60)
+
+        # ------------------------------------------------------------
+        # Same aggressive shortcut-learning regions as AGNSpectraDataset
+        # ------------------------------------------------------------
+        self.aggressive_mask_regions = [
+            (4575.0, 5550.0),  # Hβ + [O III] + Fe II / blue diagnostic region
+            (5800.0, 5950.0),  # He I 5876 region
+            (6200.0, 6699.0),  # [O I] + Hα + [N II] / red diagnostic region
+        ]
+
+    def __len__(self):
+        return self.epoch_size
+
+    def _mask_wavelength_range(self, x, start_wave, end_wave):
+        """
+        Mask a wavelength interval by setting it to zero.
+        Same logic as AGNSpectraDataset.
+        """
+        mask = (self.wavelengths >= start_wave) & (self.wavelengths <= end_wave)
+        x[..., mask] = 0.0
+        return x
+
+    def _apply_random_broad_line_mask(self, x):
+        """
+        Training-time augmentation.
+
+        Choose one broad-line-sensitive region, then mask a random
+        contiguous sub-window inside that region.
+
+        Same logic as AGNSpectraDataset.
+        """
+        if torch.rand(1).item() > self.augmentation_prob:
+            return x
+
+        region_idx = torch.randint(
+            low=0,
+            high=len(self.augmentation_line_regions),
+            size=(1,),
+        ).item()
+
+        _, region_start, region_end = self.augmentation_line_regions[region_idx]
+
+        region_mask = (
+            (self.wavelengths >= region_start)
+            & (self.wavelengths <= region_end)
+        )
+
+        valid_idx = torch.where(region_mask)[0]
+
+        if valid_idx.numel() < 2:
+            return x
+
+        min_len = max(2, int(self.augmentation_min_frac * valid_idx.numel()))
+        max_len = max(min_len, int(self.augmentation_max_frac * valid_idx.numel()))
+
+        mask_len = torch.randint(
+            low=min_len,
+            high=max_len + 1,
+            size=(1,),
+        ).item()
+
+        max_start = valid_idx.numel() - mask_len
+        if max_start < 0:
+            return x
+
+        start_pos = torch.randint(
+            low=0,
+            high=max_start + 1,
+            size=(1,),
+        ).item()
+
+        selected_idx = valid_idx[start_pos:start_pos + mask_len]
+        x[..., selected_idx] = 0.0
+
+        return x
+
+    def _apply_extra_random_mask(self, x):
+        """
+        Optional small random local mask.
+        Same logic as AGNSpectraDataset.
+        """
+        if torch.rand(1).item() > self.extra_random_mask_prob:
+            return x
+
+        seq_len = x.shape[-1]
+        min_len, max_len = self.extra_random_mask_len_range
+
+        if seq_len <= min_len:
+            return x
+
+        max_len = min(max_len, seq_len - 1)
+
+        mask_len = torch.randint(
+            low=min_len,
+            high=max_len + 1,
+            size=(1,),
+        ).item()
+
+        start_idx = torch.randint(
+            low=0,
+            high=seq_len - mask_len + 1,
+            size=(1,),
+        ).item()
+
+        x[..., start_idx:start_idx + mask_len] = 0.0
+
+        return x
+
+    def _apply_aggressive_line_ablation(self, x):
+        """
+        Deterministic shortcut-learning test.
+
+        Masks all major diagnostic regions.
+        Same logic as AGNSpectraDataset.
+        """
+        for start_wave, end_wave in self.aggressive_mask_regions:
+            x = self._mask_wavelength_range(x, start_wave, end_wave)
+
+        return x
+
+    def get_spectrum(self, idx):
+        x = self.df.loc[idx, self.flux_cols].values.astype(np.float32)
+        x = torch.tensor(x, dtype=torch.float32).unsqueeze(0)  # [1, SeqLen]
+
+        # Deterministic aggressive masking for shortcut-learning tests.
+        if self.mask_lines:
+            x = self._apply_aggressive_line_ablation(x)
+
+        # Optional random training augmentation.
+        # Usually use only when mode == "train".
+        if self.apply_masking:
+            x = self._apply_random_broad_line_mask(x)
+
+            if self.use_extra_random_mask:
+                x = self._apply_extra_random_mask(x)
+
+        return x
+
+    def find_matched_partner(self, anchor_idx, partner_type):
+        anchor = self.df.loc[anchor_idx]
+
+        candidate_indices = self.indices_by_type[partner_type]
+
+        # Avoid pairing object with itself when possible.
+        if "obj_id" in self.df.columns:
+            candidate_indices = np.array([
+                idx for idx in candidate_indices
+                if self.df.loc[idx, "obj_id"] != anchor["obj_id"]
+            ])
+        else:
+            candidate_indices = np.array([
+                idx for idx in candidate_indices
+                if idx != anchor_idx
+            ])
+
+        if len(candidate_indices) == 0:
+            raise RuntimeError(
+                f"No valid partner candidates found for "
+                f"anchor_idx={anchor_idx}, partner_type={partner_type}"
+            )
+
+        candidates = self.df.loc[candidate_indices]
+
+        dz = (candidates["z"].values - anchor["z"]) / self.z_std
+        dsnr = (candidates["snr"].values - anchor["snr"]) / self.snr_std
+
+        dist = dz**2 + dsnr**2
+
+        if self.mode == "train":
+            k = min(self.k_neighbors, len(candidate_indices))
+            nearest_positions = np.argsort(dist)[:k]
+            chosen_position = np.random.choice(nearest_positions)
+        else:
+            chosen_position = np.argmin(dist)
+
+        partner_idx = candidate_indices[chosen_position]
+
+        return partner_idx
+
+    def __getitem__(self, i):
+        # 1. Choose pair label according to desired prior.
+        # target = 1 means change-like.
+        # target = 0 means static-like.
+        target = 1 if np.random.rand() < self.change_pair_prob else 0
+
+        # 2. Choose anchor type.
+        anchor_type = np.random.choice([1, 2])
+
+        # 3. Choose anchor object.
+        anchor_idx = np.random.choice(self.indices_by_type[anchor_type])
+
+        # 4. Choose partner type based on target.
+        if target == 0:
+            partner_type = anchor_type
+        else:
+            partner_type = 2 if anchor_type == 1 else 1
+
+        # 5. Find matched partner in z/SNR space.
+        partner_idx = self.find_matched_partner(
+            anchor_idx=anchor_idx,
+            partner_type=partner_type,
+        )
+
+        x1 = self.get_spectrum(anchor_idx)
+        x2 = self.get_spectrum(partner_idx)
+
+        # 6. Randomly swap order during training only.
+        if self.mode == "train" and np.random.rand() > 0.5:
+            x1, x2 = x2, x1
+
+        y = torch.tensor([target], dtype=torch.float32)
+
+        return x1, x2, y
