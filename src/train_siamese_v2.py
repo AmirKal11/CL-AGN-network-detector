@@ -112,6 +112,50 @@ def _auc(probs: np.ndarray, labels: np.ndarray) -> float:
                      / (len(pos) * len(neg)))
 
 
+def _pr_auc(probs: np.ndarray, labels: np.ndarray) -> float:
+    """Average precision (area under precision-recall). Threshold-free, recall-first
+    ranking metric used for model selection."""
+    labels = labels.astype(np.int64)
+    npos = int((labels == 1).sum())
+    if npos == 0 or npos == len(labels):
+        return float("nan")
+    try:
+        from sklearn.metrics import average_precision_score
+        return float(average_precision_score(labels, probs))
+    except Exception:
+        order = np.argsort(-probs)
+        y = labels[order]
+        tp = np.cumsum(y)
+        fp = np.cumsum(1 - y)
+        prec = tp / np.maximum(tp + fp, 1)
+        rec = tp / npos
+        rec_prev = np.concatenate([[0.0], rec[:-1]])
+        return float(np.sum((rec - rec_prev) * prec))
+
+
+def _recall_at_fpr(probs: np.ndarray, labels: np.ndarray, max_fpr: float) -> dict:
+    """Deployment operating point: threshold giving MAX recall s.t. FPR <= max_fpr
+    (the inspection-budget ceiling). Tie-break: lower FPR."""
+    labels = labels.astype(np.int64)
+    npos = max(int((labels == 1).sum()), 1)
+    nneg = max(int((labels == 0).sum()), 1)
+    best = {"threshold": 1.0, "recall": 0.0, "precision": 0.0, "fpr": 0.0,
+            "tp": 0, "fp": 0, "tn": nneg, "fn": npos}
+    for thr in np.unique(np.concatenate([probs, [1.0]])):
+        pred = probs >= thr
+        tp = int((pred & (labels == 1)).sum())
+        fp = int((pred & (labels == 0)).sum())
+        fpr = fp / nneg
+        if fpr > max_fpr:
+            continue
+        rec = tp / npos
+        if (rec > best["recall"]) or (rec == best["recall"] and fpr < best["fpr"]):
+            best = {"threshold": float(thr), "recall": rec,
+                    "precision": tp / max(tp + fp, 1), "fpr": fpr,
+                    "tp": tp, "fp": fp, "tn": nneg - fp, "fn": npos - tp}
+    return best
+
+
 def _threshold_sweep(probs: np.ndarray,
                      labels: np.ndarray,
                      beta: float,
@@ -213,6 +257,7 @@ def main():
         cache_path=cache_path,
         oiii_snr_min=pp["oiii_snr_min"],
         subtract_continuum=False,           # v2 representation
+        split_filter="train"
     )
     n_pairs = len(arrays["y"])
     n_pos = int((arrays["y"] == 1).sum())
@@ -248,15 +293,30 @@ def main():
     # Option C: oversample positives to target a configurable batch rate
     # without throwing away any negatives. sampler_pos_rate = 0 disables it.
     sampler_pos_rate = float(s.get("sampler_pos_rate", 0.0))
+    source_balanced = bool(s.get("source_balanced", False))   # v4
     if sampler_pos_rate > 0.0:
         y_train = arrays["y"][train_idx]
         n_pos = max(int((y_train == 1).sum()), 1)
         n_neg = max(int((y_train == 0).sum()), 1)
-        # Per-sample weight: positives get w_pos, negatives get w_neg, such
-        # that E[positive fraction per batch] = sampler_pos_rate.
-        w_pos = sampler_pos_rate / n_pos
-        w_neg = (1.0 - sampler_pos_rate) / n_neg
-        weights = np.where(y_train == 1, w_pos, w_neg).astype(np.float64)
+        weights = np.empty(len(y_train), dtype=np.float64)
+        # negatives share (1 - pos_rate) uniformly
+        weights[y_train == 0] = (1.0 - sampler_pos_rate) / n_neg
+        surv_train = (arrays["survey"][train_idx]
+                      if source_balanced and "survey" in arrays else None)
+        if surv_train is not None and len(set(surv_train[y_train == 1])) > 1:
+            # v4 source-balanced: split the positive mass EQUALLY across the
+            # surveys present in positives, so the head sees the scarce SDSS-V
+            # positives as often as the abundant DESI ones (attacks the
+            # 81-vs-434 imbalance that biased the head toward DESI).
+            uniq = sorted(set(surv_train[y_train == 1].tolist()))
+            for sv in uniq:
+                m = (y_train == 1) & (surv_train == sv)
+                n_sv = max(int(m.sum()), 1)
+                weights[m] = sampler_pos_rate / (len(uniq) * n_sv)
+            print(f"[siamese] source-balanced positives across {uniq} "
+                  f"(equal mass per survey)")
+        else:
+            weights[y_train == 1] = sampler_pos_rate / n_pos
         sampler = WeightedRandomSampler(
             weights=torch.as_tensor(weights),
             num_samples=len(y_train),    # one "epoch" still = dataset size
@@ -297,7 +357,7 @@ def main():
     model = model.to(device)
 
     # ---- optionally freeze the encoder (linear-probe regime) -----------
-    encoder_freeze = bool(s.get("encoder_freeze", False))
+    encoder_freeze = bool(s.get("encoder_freeze", True))
     enc_params = list(model.encoder.parameters())
     head_params = list(model.head.parameters())
     if encoder_freeze:
@@ -328,22 +388,31 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     ckpt_path = os.path.join(BASE_DIR, paths["siamese_checkpoint"])
 
-    # ---- F0.5 threshold-sweep config (mirrors v1 train_siamese.py) -----
-    fbeta_beta = float(s.get("fbeta_beta", 0.5))
-    min_recall = float(s.get("min_recall", 0.10))
-    max_fpr    = float(s.get("max_fpr", 0.01))
-    print(f"[siamese] threshold sweep: beta={fbeta_beta}  "
-          f"min_recall={min_recall}  max_fpr={max_fpr}")
+    # ---- recall-first selection config --------------------------------
+    # Candidate ranker: CHECKPOINT is selected on the MEAN of per-survey PR-AUC
+    # (each survey weighted equally so the larger DESI count can't drown SDSS-V),
+    # and the saved deployment threshold is max recall at FPR<=max_fpr on SDSS-V.
+    fbeta_beta = float(s.get("fbeta_beta", 2.0))   # kept in ckpt metadata only
+    min_recall = float(s.get("min_recall", 0.10))  # informational
+    max_fpr    = float(s.get("max_fpr", 0.05))     # B/N inspection-budget ceiling
+
+    val_survey = np.asarray(arrays["survey"][val_idx]) if "survey" in arrays else None
+    y_val = arrays["y"][val_idx]
+    if val_survey is not None:
+        sel_surveys = [sv for sv in np.unique(val_survey)
+                       if int((y_val[val_survey == sv] == 1).sum()) >= 1]
+    else:
+        sel_surveys = []
+    op_survey = "sdssv" if (val_survey is not None and "sdssv" in sel_surveys) else None
+    print(f"[siamese] selection = mean PR-AUC over surveys "
+          f"{sel_surveys or ['(full val)']}; operating point on "
+          f"{op_survey or 'full val'} @FPR<={max_fpr}")
 
     history = {
-        "train_loss": [], "val_loss": [],
-        "val_auc": [],
-        "val_fbeta": [], "val_prec": [], "val_rec": [], "val_fpr": [],
-        "val_threshold": [],
+        "train_loss": [], "val_loss": [], "val_auc": [], "val_prauc": [],
+        "val_prec": [], "val_rec": [], "val_fpr": [], "val_threshold": [],
     }
-    # Best is tracked as the (fbeta, precision, -fpr, recall) tuple so
-    # tie-breaking matches the v1 logic exactly.
-    best_score = (-1.0, -1.0, -1.0, -1.0)
+    best_score = -1.0          # best mean per-survey PR-AUC seen so far
     best_threshold = None
     best_threshold_metrics = None
 
@@ -382,82 +451,86 @@ def main():
         val_loss = vrun / max(vnb, 1)
         probs = np.concatenate(all_probs).ravel()
         labels = np.concatenate(all_labels).ravel().astype(int)
+        # v4: per-survey PR-AUC -> mean (selection); operating point on SDSS-V.
         val_auc = _auc(probs, labels)
-        chosen, sweep, used_fallback = _threshold_sweep(
-            probs, labels,
-            beta=fbeta_beta, min_recall=min_recall, max_fpr=max_fpr,
-        )
+        if sel_surveys:
+            prauc_by = {sv: _pr_auc(probs[val_survey == sv], labels[val_survey == sv])
+                        for sv in sel_surveys}
+            vals = [v for v in prauc_by.values() if v == v]      # drop NaN
+            mean_prauc = float(np.mean(vals)) if vals else float("nan")
+        else:
+            prauc_by = {"all": _pr_auc(probs, labels)}
+            mean_prauc = prauc_by["all"]
+        if op_survey is not None:
+            m = val_survey == op_survey
+            op = _recall_at_fpr(probs[m], labels[m], max_fpr)
+        else:
+            op = _recall_at_fpr(probs, labels, max_fpr)
         sched.step()
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["val_auc"].append(val_auc)
-        history["val_fbeta"].append(chosen["fbeta"])
-        history["val_prec"].append(chosen["precision"])
-        history["val_rec"].append(chosen["recall"])
-        history["val_fpr"].append(chosen["fpr"])
-        history["val_threshold"].append(chosen["threshold"])
+        history["val_prauc"].append(mean_prauc)
+        history["val_prec"].append(op["precision"])
+        history["val_rec"].append(op["recall"])
+        history["val_fpr"].append(op["fpr"])
+        history["val_threshold"].append(op["threshold"])
 
-        fb_tag = "FALLBACK" if used_fallback else "       "
+        by_str = " ".join(f"{sv}={prauc_by[sv]:.2f}" for sv in prauc_by)
         print(
             f"[siamese] ep {epoch + 1:3d}/{s['num_epochs']}  "
             f"train {train_loss:.4f}  val {val_loss:.4f}  "
-            f"Thr {chosen['threshold']:.2f}  F{fbeta_beta} {chosen['fbeta']:.3f}  "
-            f"prec {chosen['precision']:.3f}  rec {chosen['recall']:.3f}  "
-            f"FPR {chosen['fpr']:.3f}  AUC {val_auc:.3f}  "
-            f"TP/FP={chosen['tp']}/{chosen['fp']}  {fb_tag}  "
+            f"meanPR-AUC {mean_prauc:.3f} ({by_str})  AUC {val_auc:.3f}  | "
+            f"op[{op_survey or 'all'}]@FPR<={max_fpr}: thr {op['threshold']:.2f} "
+            f"rec {op['recall']:.3f} prec {op['precision']:.3f} fpr {op['fpr']:.3f}  "
             f"[{time.time() - t0:.0f}s]"
         )
 
-        # Model selection: same tuple-priority as v1 train_siamese.py.
-        current_score = (
-            chosen["fbeta"],
-            chosen["precision"],
-            -chosen["fpr"],
-            chosen["recall"],
-        )
-        if current_score > best_score:
-            best_score = current_score
-            best_threshold = chosen["threshold"]
-            best_threshold_metrics = chosen
+        # Model selection: highest MEAN per-survey PR-AUC (all surveys equal weight).
+        if mean_prauc > best_score:
+            best_score = mean_prauc
+            best_threshold = op["threshold"]      # max recall at FPR<=max_fpr (budget)
+            best_threshold_metrics = op
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "epoch": epoch + 1,
                 "best_threshold": best_threshold,
                 "best_threshold_metrics": best_threshold_metrics,
-                "best_score": best_score,
+                "val_pr_auc_mean": mean_prauc,
+                "val_pr_auc_by_survey": {k: float(v) for k, v in prauc_by.items()},
                 "val_auc": val_auc,
                 "val_loss": val_loss,
                 "channel1_scale": channel1_scale,
-                "fbeta_beta": fbeta_beta,
-                "min_recall": min_recall,
+                "selection_metric": "mean_per_survey_pr_auc",
+                "op_survey": op_survey or "all",
                 "max_fpr": max_fpr,
+                "min_recall": min_recall,
+                "fbeta_beta": fbeta_beta,
             }, ckpt_path)
-            print(f"[siamese]   saved best -> {ckpt_path}  "
-                  f"(F{fbeta_beta}={chosen['fbeta']:.4f}, "
-                  f"thr={best_threshold:.2f}, "
-                  f"prec={chosen['precision']:.4f}, "
-                  f"rec={chosen['recall']:.4f})")
+            print(f"[siamese]   saved best (mean PR-AUC={mean_prauc:.4f}) -> "
+                  f"{ckpt_path}  thr={best_threshold:.2f} rec={op['recall']:.3f} "
+                  f"fpr={op['fpr']:.3f}")
 
     # ---- loss + metric curves -----------------------------------------
     fig, axes = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
     axes[0].plot(history["train_loss"], label="train")
     axes[0].plot(history["val_loss"], label="val")
     axes[0].set_ylabel("focal loss")
-    axes[0].set_title("Stage 2 -- Siamese fine-tune (F0.5 threshold sweep)")
+    axes[0].set_title("Stage 2 -- Siamese (mean per-survey PR-AUC selection)")
     axes[0].legend(loc="upper right", fontsize=9)
     axes[0].grid(alpha=0.3)
-    axes[1].plot(history["val_fbeta"], label=f"val F{fbeta_beta}",
+    axes[1].plot(history["val_prauc"], label="val mean PR-AUC (selection)",
                  color="#1f4e79", lw=2)
-    axes[1].plot(history["val_prec"],  label="val precision",
-                 color="#27ae60", lw=1, ls="--")
-    axes[1].plot(history["val_rec"],   label="val recall",
+    axes[1].plot(history["val_rec"],   label=f"val recall @FPR<={max_fpr}",
                  color="#c0392b", lw=1, ls="--")
-    axes[1].plot(history["val_fpr"],   label="val FPR",
+    axes[1].plot(history["val_prec"],  label="val precision @op",
+                 color="#27ae60", lw=1, ls="--")
+    axes[1].plot(history["val_fpr"],   label="val FPR @op",
                  color="#888888", lw=1, ls=":")
-    axes[1].plot(history["val_auc"],   label="val AUC (info)",
+    axes[1].plot(history["val_auc"],   label="val ROC-AUC (info)",
                  color="#888888", lw=1, alpha=0.6)
-    axes[1].plot(history["val_threshold"], label="chosen threshold",
+    axes[1].plot(history["val_threshold"], label="op threshold",
                  color="#000000", lw=1, alpha=0.4)
     axes[1].set_xlabel("epoch")
     axes[1].set_ylabel("metric / threshold")
@@ -469,11 +542,13 @@ def main():
     plt.close(fig)
 
     print(f"[siamese] done.")
-    print(f"[siamese]   best F{fbeta_beta} = {best_score[0]:.4f}")
-    print(f"[siamese]   best threshold    = {best_threshold:.2f}")
-    print(f"[siamese]   best metrics      = "
-          f"prec={best_score[1]:.4f}  fpr={-best_score[2]:.4f}  "
-          f"rec={best_score[3]:.4f}")
+    print(f"[siamese]   best mean per-survey PR-AUC = {best_score:.4f}")
+    print(f"[siamese]   deployment threshold (recall@FPR<={max_fpr}, SDSS-V) "
+          f"= {best_threshold:.2f}")
+    if best_threshold_metrics:
+        print(f"[siamese]   op metrics = rec={best_threshold_metrics['recall']:.4f}  "
+              f"prec={best_threshold_metrics['precision']:.4f}  "
+              f"fpr={best_threshold_metrics['fpr']:.4f}")
     print(f"[siamese] checkpoint: {ckpt_path}")
 
 

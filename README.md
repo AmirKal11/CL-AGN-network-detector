@@ -12,6 +12,10 @@ On a held-out test of 50 confirmed CL-AGN and 350 static controls, the final mod
 
 The headline design choice: **no spectral-decomposition / line-fitting algorithm is used anywhere.** The network is meant to *replace* that fitting step, learning the relevant physics from data.
 
+**Update — v4, a recall-first rebuild (§7).** A deeper audit found that the per-survey recall numbers below were partly a **confound**: in the labeled data, *which surveys formed a pair* was correlated with the label, so the network could shortcut on survey / instrument / redshift instead of the physics. v4 rebuilds the labeled set to be confound-free — every pair is **SDSS-DR16 × {SDSS-V | DESI}** with **type-verified negatives so survey ⊥ label** — and reframes the task as a **recall-first candidate ranker** (the real deployment: surface CL-AGN for visual inspection). On the confound-free test, **SDSS-V recall rises from 0.05 → 0.75** at a 3% false-positive rate (≈0.95 at a looser threshold), with **PR-AUC = 0.83** and **97% of all positives recovered in the top-150 ranked candidates** — still no line-fitting, and with **no redshift/survey shortcut** (per-z recall is flat).
+
+![v4 results: recall vs budget, per-z recall, and the SDSS-V recall jump](figures/10_v4_results.png)
+
 ---
 
 ## Table of contents
@@ -21,9 +25,10 @@ The headline design choice: **no spectral-decomposition / line-fitting algorithm
 3. [First setup, and what its failures taught us](#3-first-setup-and-what-its-failures-taught-us)
 4. [The redesign: self-supervised pretraining + frozen Siamese](#4-the-redesign)
 5. [The survey-extension experiment: full retrain vs. continual learning](#5-the-survey-extension-experiment)
-6. [Results and conclusions](#6-results-and-conclusions)
-7. [Repository layout & reproducing](#7-repository-layout--reproducing)
-8. [References](#8-references)
+6. [Results and conclusions (v2 / Phase A / Phase B)](#6-results-and-conclusions)
+7. [v4: removing the confounds — a recall-first rebuild](#7-v4-removing-the-confounds--a-recall-first-rebuild)
+8. [Repository layout & reproducing](#8-repository-layout--reproducing)
+9. [References](#9-references)
 
 ---
 
@@ -46,7 +51,7 @@ An AGN that shows **broad + narrow lines** is **Type 1**; one that shows **only 
 
 ### Changing-look AGN: the engine flips a switch
 
-A **changing-look AGN (CL-AGN)** breaks that picture. It is a single object observed to **transition between Type 1 and Type 2 within years** — broad lines appear ("turn-on") or vanish ("turn-off"), accompanied by a large continuum brightening or dimming. The first luminous example was discovered by [LaMassa et al. (2015)](#8-references); systematic searches since then ([MacLeod et al. 2016, 2019](#8-references); [Guo et al. 2024, 2025](#8-references) with DESI) have grown the sample from one object to hundreds.
+A **changing-look AGN (CL-AGN)** breaks that picture. It is a single object observed to **transition between Type 1 and Type 2 within years** — broad lines appear ("turn-on") or vanish ("turn-off"), accompanied by a large continuum brightening or dimming. The first luminous example was discovered by [LaMassa et al. (2015)](#9-references); systematic searches since then ([MacLeod et al. 2016, 2019](#9-references); [Guo et al. 2024, 2025](#9-references) with DESI) have grown the sample from one object to hundreds.
 
 **Why it matters.** A geometric obscuration change cannot happen that fast — the dusty torus is light-years across. So CL-AGN are direct evidence that the *accretion flow itself* changes state on observable timescales, a probe of black-hole accretion physics that standard disk theory struggles to explain. They are rare, scientifically valuable, and — crucially for machine learning — **hard to find**: they hide among millions of static AGN, and confirming one traditionally requires careful, hand-tuned spectral fitting of each candidate.
 
@@ -76,7 +81,7 @@ Spectra come from four optical spectroscopic surveys, which matters a great deal
 | **SDSS DR16** (BOSS/eBOSS) | first epoch of most labeled pairs | mid |
 | **SDSS-V** | second epoch of low-z labeled pairs | newest |
 
-The labeled CL-AGN positives come from two places: a hand-curated low-redshift set (`lowz`, 54 real positives originally) of SDSS-V × DR16 pairs, and the DESI CL-AGN catalog of [Guo et al.](#8-references) (`paper2`, DESI × DR16 pairs), which selected the most dramatic transitions.
+The labeled CL-AGN positives come from two places: a hand-curated low-redshift set (`lowz`, 54 real positives originally) of SDSS-V × DR16 pairs, and the DESI CL-AGN catalog of [Guo et al.](#9-references) (`paper2`, DESI × DR16 pairs), which selected the most dramatic transitions.
 
 ### The two-channel spectral representation
 
@@ -164,7 +169,7 @@ The v2 pipeline is **two stages**: self-supervised pretraining of an encoder, th
 
 ### 4.1 Stage 1 — self-supervised masked-reconstruction pretraining
 
-Instead of teaching the encoder to classify (where it can cheat), we teach it to **reconstruct masked spectra** — a label-free objective that forces it to learn the structure of real spectra. This is a 1-D analogue of a masked autoencoder ([He et al. 2022](#8-references)) with SpecAugment-style span masking ([Park et al. 2019](#8-references)):
+Instead of teaching the encoder to classify (where it can cheat), we teach it to **reconstruct masked spectra** — a label-free objective that forces it to learn the structure of real spectra. This is a 1-D analogue of a masked autoencoder ([He et al. 2022](#9-references)) with SpecAugment-style span masking ([Park et al. 2019](#9-references)):
 
 - A `MaskedSpectraAutoencoder` (2-channel encoder + lightweight decoder) is trained on a large pool of **unlabeled** spectra.
 - Random contiguous **spans are blanked** (mask ratio 0.5; span lengths 64–384 px, drawn only from each spectrum's *covered* region so the masking budget isn't wasted on zero-filled pixels). The decoder reconstructs the original; **MSE is scored only on masked + covered pixels.**
@@ -268,7 +273,59 @@ Because false positives are the expensive error in survey astronomy, the operati
 
 ---
 
-## 7. Repository layout & reproducing
+## 7. v4: removing the confounds — a recall-first rebuild
+
+§5–6 told a hopeful story: adding the deployment surveys to pretraining lifted the hard-population (`lowz`) recall from 0.10 to 0.25. A later audit showed that story was **built on a confound**, and fixing it changed both the data and the objective.
+
+### 7.1 The confound: survey-pairing ≈ label
+
+Re-examining the labeled set revealed that **nearly every negative pair was a DR16 × SDSS-V cross-match, while a large fraction of positives were DESI × DR16** (the Guo+ catalog). So *which two surveys formed a pair* was strongly correlated with the label — and a network can reach high apparent recall by detecting "is there a DESI spectrum here?" rather than "did the broad lines change?" A per-survey breakdown then *looks* like survey-OOD when it is partly this shortcut. A controlled check made it concrete: evaluated on the **same** leak-free test, the "more balanced" v3 encoder did **not** beat v2 — the old gains tracked the confound, not representation quality.
+
+Two further confounds rode along:
+- **Instrument confound.** Type-verified negatives were first built from legacy **DR7** (SDSS-I/II spectrograph) early epochs, while positives' early epochs are mostly **BOSS/eBOSS** — so "old spectrograph present" again predicted the label.
+- **Redshift confound.** Same-object SDSS × DESI non-CL-AGN exist essentially only at **z < 0.4**, so high-z DESI positives had no z-matched negatives → redshift alone separated the classes on the DESI arm.
+
+### 7.2 The rebuild: making survey, instrument, and redshift uninformative
+
+Every label now comes from **external catalogs** (SDSS spAll `SUBCLASS`, DESI `AGN_TYPE`) — still no fitting. The labeled set was rebuilt so the model cannot shortcut:
+
+- **Every pair is SDSS-DR16 (BOSS/eBOSS) × {SDSS-V | DESI}**, instrument-matched between positives and negatives. **DR7 is used only in the encoder, never in a pair.**
+- **Type-verified negatives for both arms** (same external type at both epochs), drawn so the **neg:pos ratio is equal across surveys** → survey carries no information about the label.
+- **The DESI test arm is capped at z < 0.4** (where same-object SDSS × DESI negatives exist), removing the redshift shortcut; DESI *training* positives are kept (the SDSS-V arm, which has high-z negatives, supplies real high-z learning). **SDSS-V (DR16 × SDSS-V) is the science target; DESI is auxiliary**, included only for its larger CL-AGN count.
+- **Type-2 coverage for the encoder.** Type-2 (narrow-line) AGN were nearly absent from the encoder; v4 adds type-2 from both deployment instruments plus the on-disk DR7 typed set (~triples type-2 exposure). Type-2 *negatives* stay intrinsically scarce (two-epoch type-2 spectroscopy barely exists), so the encoder carries the type-2 burden.
+
+### 7.3 The reframe: a recall-first candidate ranker
+
+The deployment use is to **surface CL-AGN candidates from a catalog of tens of thousands for visual inspection of ≤1000** — so purity-at-all-costs is the wrong objective. v4 optimizes the **ranking** instead:
+
+- the checkpoint is selected on the **mean of per-survey PR-AUC** (each survey weighted equally, so the larger DESI count can't outvote SDSS-V);
+- the deployment threshold is the **maximum recall at a false-positive rate ≤ B/N** (the inspection budget), reported but **never tuned on the test** — the held-out test only produces the ranking;
+- the encoder is checkpointed on SDSS-V + DR16 reconstruction, and the head uses source-balanced positive sampling.
+
+### 7.4 Results (confound-free held-out test: 35 CL-AGN + 700 controls)
+
+| Model / setting | SDSS-V (`lowz`) recall | DESI (`paper2`) recall | PR-AUC |
+|---|---|---|---|
+| v2 (old test) | 0.20 | 0.73 | — |
+| v3 (new test) | 0.05 | 0.63 | — |
+| **v4 @ thr 0.46** | **0.75** (15/20) | 0.87 (z<0.4) | **0.83** |
+| **v4, top-150 inspected** | **0.95** (19/20) | 1.00 (15/15) | 0.83 |
+
+*(Each version was evaluated on its own rebuilt held-out test, so the SDSS-V jump is the signal of the confound fix + recall-first reframe, not a like-for-like leaderboard.)*
+
+At the val-chosen threshold (0.46) the SDSS-V arm reaches **recall 0.75 at a 3% false-positive rate**; the ranking is strong enough that **inspecting the top ~150 candidates recovers 97% of all positives** (≈95% of SDSS-V alone). Crucially, **per-z recall is flat (0.75–1.0 across z-bins)** and the false positives do **not** cluster near the top of the ranking — the detector keys on the transition, not on redshift, survey, or instrument, and stable type-2 objects are not false-flagged.
+
+![v4 held-out test: redshift by source and survey × label](figures/11_v4_test_redshift.png)
+
+### 7.5 What changed in the takeaways
+
+- The §6 per-survey "gains" were **partly a survey-pairing artifact**; the honest result requires confound-free negatives. *On a domain where labels correlate with provenance, "which survey" is a shortcut as dangerous as any continuum-color cheat.*
+- With the confounds removed, **pretraining-pool coverage still matters** — the type-2 encoder boost is what lets the head place stable type-2 objects correctly.
+- Reframing from purity-first (F0.5) to a **recall-first ranker** matches the actual scientific workflow and turns a 5% recall into 75–95% at an inspectable budget.
+
+---
+
+## 8. Repository layout & reproducing
 
 **Environment:** conda `astro_dl`, Python 3.10, Apple Silicon (MPS).
 
@@ -279,10 +336,12 @@ src/
   data_preprocessing.py     # FITS → parquet, sky-line removal, SNR cut, continuum
   architectures.py          # reused conv/transformer blocks + focal loss (+ v1 SpectraNet)
   architectures_v2.py       # SpectraEncoder, MaskedSpectraAutoencoder, SiameseChangeNet
-  datasets_v2.py            # SSL + real-pair datasets, pair-array cache
-  pretrain_ssl.py           # Stage 1 (supports --resume-from / --replay for continual)
-  train_siamese_v2.py       # Stage 2 (frozen encoder, F0.5 threshold sweep)
-  eval_clagn_test.py        # held-out eval: overall + per-source + per-z + PR curve
+  datasets_v2.py            # SSL + real-pair datasets, pair-array cache, 2-root spectrum resolve
+  pretrain_ssl.py           # Stage 1 (SSL; checkpoint on SDSS-V+DR16 recon val)
+  train_siamese_v2.py       # Stage 2 (frozen encoder; mean per-survey PR-AUC selection)
+  eval_clagn_test.py        # held-out eval: per-source + per-z + per-object prob ranking
+  paths_v4.py               # data-path config (where the prepared pairs / SSL parquets live)
+  analyze_v4_data.py        # redshift histograms per phase (run on the prepared data)
   utils.py, smoke_test.py
   # --- original (v1) network, documented in §3 ---
   train_classifier.py       # Type 1/2 single-spectrum classifier (SpectraNet)
@@ -293,12 +352,24 @@ config_v2.yml               # active pipeline config (paths, SSL/Siamese hyperpa
 config.yml                  # original (v1) network config
 models/
   clagn_v2_baseline/        # baseline (DR7+DESI encoder)        — the original v2 model
-  clagn_v2_extended/  # Phase A (full retrain, 53k)        — the chosen model
+  clagn_v2_extended/  # Phase A (full retrain, 53k)        — superseded by v4 (§7)
   clagn_v2_continual/ # Phase B (continual + replay)
+  clagn_v4/           # v4 confound-free, recall-first model (§7) — the current best
   v1_backbone/        # original Type 1/2 backbone (the §3 confusion matrices)
 data/                 # gitignored — large; sourced from public SDSS / DESI archives
                       #   processed_agn_new_MAD_scaling.parquet → v1 training catalog
 ```
+
+> **v4 (§7) pipeline.** This repo ships the **modeling** pipeline and assumes the data is
+> already prepared: a directory of pair FITS, a pickle matching FITS to same-object two-epoch
+> pairs (train + held-out test), and the unlabeled SSL parquets — the paths are set in
+> `config_v2.yml` / `paths_v4.py`. `train_siamese_v2.py` / `eval_clagn_test.py` /
+> `pretrain_ssl.py` carry the recall-first selection (mean per-survey PR-AUC, recall-at-budget
+> threshold, SDSS-V+DR16 SSL checkpointing). The upstream catalog-building, cross-matching and
+> FITS-download code is **not** shipped — it is specific to the SDSS spAll / DESI VAC archives
+> and produces the (gitignored) data; how those confound-free inputs were constructed is
+> documented in [`docs/DATA_INVENTORY.md`](docs/DATA_INVENTORY.md) and the project handoff
+> [`docs/HANDOFF.md`](docs/HANDOFF.md).
 
 **Pipeline (per experiment):**
 
@@ -318,7 +389,7 @@ Output directories are isolated per experiment via `config_v2.yml`, so the basel
 
 ---
 
-## 8. References
+## 9. References
 
 *Citations should be verified against the published versions before use in a formal manuscript.*
 

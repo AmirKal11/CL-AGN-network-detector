@@ -34,7 +34,7 @@ import time
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, WeightedRandomSampler, random_split
+from torch.utils.data import DataLoader, WeightedRandomSampler, random_split, Subset
 
 import matplotlib
 matplotlib.use("Agg")
@@ -213,6 +213,26 @@ def main():
     train_set, val_set = random_split(dataset, [n_train, n_val], generator=gen)
     print(f"[ssl] train {n_train:,}  val {n_val:,}")
 
+    # ---- v4: SDSS-V-prioritized checkpoint selection -------------------
+    # Encoder has no CL-AGN labels, so we select on RECONSTRUCTION val MSE
+    # restricted to the deployment surveys (SDSS-V + DR16) instead of the
+    # global (DR7-heavy) val. Biases the encoder toward our survey.
+    select_surveys = list(s.get("select_survey", ["sdssv", "dr16"]))
+    val_idx = np.asarray(val_set.indices)
+    all_surveys = np.asarray(dataset.meta["survey"].values)
+    sel_mask = np.isin(all_surveys[val_idx], select_surveys)
+    if sel_mask.any():
+        sel_val_loader = DataLoader(
+            Subset(dataset, val_idx[sel_mask].tolist()),
+            batch_size=s["batch_size"], shuffle=False,
+            num_workers=s["num_workers"])
+        print(f"[ssl] checkpoint-selection val: {int(sel_mask.sum()):,} "
+              f"{select_surveys} spectra (of {len(val_idx):,} val)")
+    else:
+        sel_val_loader = None
+        print(f"[ssl] WARNING: no {select_surveys} spectra in val; "
+              f"selecting on global val instead")
+
     # ---- replay sampler (50/50 old:new) for continual pretraining -----
     if args.replay:
         # SSLSpectraDataset carries .meta with a 'survey' column for every row.
@@ -296,8 +316,20 @@ def main():
     # ---- pre-training input sanity check --------------------------------
     plot_input_sample(dataset, out_dir)
 
-    history = {"train": [], "val": []}
+    history = {"train": [], "val": [], "sel_val": []}
     best_val = float("inf")
+
+    def _val_loss(loader):
+        model.eval()
+        vrun, vnb = 0.0, 0
+        with torch.no_grad():
+            for x, valid in loader:
+                x = x.to(device); valid = valid.to(device)
+                x_masked, span = apply_span_mask(x, valid, s["mask_ratio"],
+                                                 s["min_span"], s["max_span"])
+                vrun += masked_mse(model(x_masked), x, span, valid).item()
+                vnb += 1
+        return vrun / max(vnb, 1)
 
     # ---- training loop --------------------------------------------------
     for epoch in range(s["num_epochs"]):
@@ -319,39 +351,34 @@ def main():
             nb += 1
         train_loss = running / max(nb, 1)
 
-        model.eval()
-        vrun, vnb = 0.0, 0
-        with torch.no_grad():
-            for x, valid in val_loader:
-                x = x.to(device)
-                valid = valid.to(device)
-                x_masked, span = apply_span_mask(x, valid, s["mask_ratio"],
-                                                 s["min_span"], s["max_span"])
-                recon = model(x_masked)
-                vrun += masked_mse(recon, x, span, valid).item()
-                vnb += 1
-        val_loss = vrun / max(vnb, 1)
+        val_loss = _val_loss(val_loader)
+        # v4: selection metric = recon val on SDSS-V+DR16 only (falls back to global)
+        sel_val = _val_loss(sel_val_loader) if sel_val_loader is not None else val_loss
         sched.step()
 
         history["train"].append(train_loss)
         history["val"].append(val_loss)
+        history["sel_val"].append(sel_val)
         print(f"[ssl] epoch {epoch + 1:3d}/{s['num_epochs']}  "
               f"train {train_loss:.5f}  val {val_loss:.5f}  "
-              f"({time.time() - t0:.0f}s)")
+              f"sel_val {sel_val:.5f}  ({time.time() - t0:.0f}s)")
 
-        if val_loss < best_val:
-            best_val = val_loss
+        if sel_val < best_val:
+            best_val = sel_val
             torch.save({"encoder_state_dict": model.encoder.state_dict(),
                         "decoder_state_dict": model.decoder.state_dict(),
                         "channel1_scale": dataset.channel1_scale,
                         "epoch": epoch + 1,
-                        "val_loss": val_loss}, ckpt_path)
-            print(f"[ssl]   saved best encoder -> {ckpt_path}")
+                        "val_loss": val_loss,
+                        "sel_val_loss": sel_val,
+                        "select_surveys": select_surveys}, ckpt_path)
+            print(f"[ssl]   saved best encoder (sel_val={sel_val:.5f}) -> {ckpt_path}")
 
     # ---- loss curve -----------------------------------------------------
     plt.figure(figsize=(8, 5))
     plt.plot(history["train"], label="train")
-    plt.plot(history["val"], label="val")
+    plt.plot(history["val"], label="val (global)")
+    plt.plot(history["sel_val"], label=f"val ({'+'.join(select_surveys)}) [selection]")
     plt.xlabel("epoch")
     plt.ylabel("masked reconstruction MSE")
     plt.title("Stage 1 -- self-supervised pretraining")
@@ -359,7 +386,7 @@ def main():
     plt.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "ssl_loss_curve.png"), dpi=150)
-    print(f"[ssl] done. best val loss = {best_val:.5f}")
+    print(f"[ssl] done. best selection val loss = {best_val:.5f}")
     print(f"[ssl] encoder ready for Stage 2: {ckpt_path}")
 
 

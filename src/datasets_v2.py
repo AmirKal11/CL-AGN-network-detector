@@ -265,32 +265,38 @@ class SSLSpectraDataset(Dataset):
 # ----------------------------------------------------------------------
 # Stage 2: real same-object pair preprocessing + dataset
 # ----------------------------------------------------------------------
+# v4: spectra are split across data_v4/ (new) and data/ (existing). Resolve by
+# searching the given dir, then both roots, so pair_spectra_dir need not be exact.
+_V4_ROOTS = [os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), d)
+             for d in ("data_v4", "data")]
+
+
 def _resolve(spectra_dir, name):
     p = str(name)
-    return p if os.path.isabs(p) else os.path.join(spectra_dir, p)
+    if os.path.isabs(p):
+        return p
+    cand = os.path.join(spectra_dir, p)
+    if os.path.exists(cand):
+        return cand
+    for r in _V4_ROOTS:
+        c = os.path.join(r, p)
+        if os.path.exists(c):
+            return c
+    return cand
 
 
 def load_or_build_pair_arrays(pkl_path, spectra_dir, cache_path=None,
                               oiii_snr_min=4.0, subtract_continuum=False,
-                              verbose=True):
+                              verbose=True, split_filter=None):
     """
     Preprocess every real epoch pair once and return parallel arrays.
 
     Heavy FITS work is done a single time and cached to .npz, so the
     train/val/test datasets are cheap index views over the same arrays.
-
-    Returns a dict with arrays (over the N pairs that preprocessed OK):
-        mad1, mad2     [N, L]     MAD-normalised flux (full continuum kept)
-        valid1, valid2 [N, L]     per-pixel coverage mask per epoch
-        oiii1, oiii2   [N]        [OIII] flux per epoch
-        rel1, rel2     [N]        [OIII] reliability flag per epoch
-        y              [N]        label (0 static, 1 CL-AGN)
-        sdssid         [N]        object id
     """
+    arrays = None
     if cache_path and os.path.exists(cache_path):
         d = np.load(cache_path, allow_pickle=True)
-        # Reuse the cache only if it matches the current grid and carries the
-        # validity masks; otherwise it predates the wide-grid change.
         cached_ok = ("valid1" in d.files
                      and d["mad1"].ndim == 2
                      and d["mad1"].shape[1] == len(MASTER_GRID)
@@ -300,81 +306,93 @@ def load_or_build_pair_arrays(pkl_path, spectra_dir, cache_path=None,
         if cached_ok:
             if verbose:
                 print(f"[pairs] loading cached preprocessing from {cache_path}")
-            return {k: d[k] for k in d.files}
+            arrays = {k: d[k] for k in d.files}
+        elif verbose:
+            print(f"[pairs] cache {cache_path} is stale (grid, format or continuum mode changed) -- rebuilding")
+
+    if arrays is None:
+        df = pd.read_pickle(pkl_path)
+        required = ["z", "specname_dr16", "specname_sdssv", "label"]
+        for c in required:
+            if c not in df.columns:
+                raise ValueError(f"crossmatch pickle missing column '{c}'")
+        has_id = "sdssid" in df.columns
+        has_survey = "survey" in df.columns
+
+        mad1, mad2 = [], []
+        valid1, valid2 = [], []
+        oiii1, oiii2, rel1, rel2 = [], [], [], []
+        ys, ids, surveys = [], [], []
+        n_fail = 0
+
+        rows = list(df.itertuples(index=False))
+        for k, row in enumerate(rows):
+            z = float(getattr(row, "z"))
+            p1 = _resolve(spectra_dir, getattr(row, "specname_dr16"))
+            p2 = _resolve(spectra_dir, getattr(row, "specname_sdssv"))
+            try:
+                f1, v1 = fits_to_flat(p1, z, subtract_continuum=subtract_continuum)
+                f2, v2 = fits_to_flat(p2, z, subtract_continuum=subtract_continuum)
+                m1, _ = mad_normalize(f1, valid=v1)
+                m2, _ = mad_normalize(f2, valid=v2)
+                o1, s1 = measure_oiii_flux(m1, valid=v1)
+                o2, s2 = measure_oiii_flux(m2, valid=v2)
+            except Exception as exc:
+                n_fail += 1
+                if verbose and n_fail <= 5:
+                    print(f"[pairs] skip row {k}: {exc}")
+                continue
+
+            mad1.append(m1)
+            mad2.append(m2)
+            valid1.append(v1)
+            valid2.append(v2)
+            oiii1.append(o1)
+            oiii2.append(o2)
+            rel1.append((s1 >= oiii_snr_min) and (o1 > 1e-6))
+            rel2.append((s2 >= oiii_snr_min) and (o2 > 1e-6))
+            ys.append(int(getattr(row, "label")))
+            ids.append(getattr(row, "sdssid") if has_id else k)
+            surveys.append(str(getattr(row, "survey")) if has_survey else "unknown")
+
+            if verbose and (k + 1) % 500 == 0:
+                print(f"[pairs] preprocessed {k + 1:,}/{len(rows):,}")
+
+        arrays = {
+            "mad1": np.asarray(mad1, dtype=np.float32),
+            "mad2": np.asarray(mad2, dtype=np.float32),
+            "valid1": np.asarray(valid1, dtype=bool),
+            "valid2": np.asarray(valid2, dtype=bool),
+            "oiii1": np.asarray(oiii1, dtype=np.float32),
+            "oiii2": np.asarray(oiii2, dtype=np.float32),
+            "rel1": np.asarray(rel1, dtype=bool),
+            "rel2": np.asarray(rel2, dtype=bool),
+            "y": np.asarray(ys, dtype=np.int64),
+            "sdssid": np.asarray(ids),
+            "survey": np.asarray(surveys),
+            "repr_continuum_subtracted": np.asarray(bool(subtract_continuum)),
+        }
         if verbose:
-            print(f"[pairs] cache {cache_path} is stale "
-                  f"(grid, format or continuum mode changed) -- rebuilding")
+            n = len(arrays["y"])
+            print(f"[pairs] preprocessed {n:,} pairs OK, {n_fail:,} failed/missing")
+            print(f"[pairs] labels: static={int((arrays['y'] == 0).sum()):,}  "
+                  f"CL-AGN={int((arrays['y'] == 1).sum()):,}")
+        if cache_path:
+            os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+            np.savez(cache_path, **arrays)
+            if verbose:
+                print(f"[pairs] cached preprocessing -> {cache_path}")
 
-    df = pd.read_pickle(pkl_path)
-    required = ["z", "specname_dr16", "specname_sdssv", "label"]
-    for c in required:
-        if c not in df.columns:
-            raise ValueError(f"crossmatch pickle missing column '{c}'")
-    has_id = "sdssid" in df.columns
-
-    mad1, mad2 = [], []
-    valid1, valid2 = [], []
-    oiii1, oiii2, rel1, rel2 = [], [], [], []
-    ys, ids = [], []
-    n_fail = 0
-
-    rows = list(df.itertuples(index=False))
-    for k, row in enumerate(rows):
-        z = float(getattr(row, "z"))
-        p1 = _resolve(spectra_dir, getattr(row, "specname_dr16"))
-        p2 = _resolve(spectra_dir, getattr(row, "specname_sdssv"))
-        try:
-            f1, v1 = fits_to_flat(p1, z, subtract_continuum=subtract_continuum)
-            f2, v2 = fits_to_flat(p2, z, subtract_continuum=subtract_continuum)
-            m1, _ = mad_normalize(f1, valid=v1)
-            m2, _ = mad_normalize(f2, valid=v2)
-            o1, s1 = measure_oiii_flux(m1, valid=v1)
-            o2, s2 = measure_oiii_flux(m2, valid=v2)
-        except Exception as exc:
-            n_fail += 1
-            if verbose and n_fail <= 5:
-                print(f"[pairs] skip row {k}: {exc}")
-            continue
-
-        mad1.append(m1)
-        mad2.append(m2)
-        valid1.append(v1)
-        valid2.append(v2)
-        oiii1.append(o1)
-        oiii2.append(o2)
-        rel1.append((s1 >= oiii_snr_min) and (o1 > 1e-6))
-        rel2.append((s2 >= oiii_snr_min) and (o2 > 1e-6))
-        ys.append(int(getattr(row, "label")))
-        ids.append(getattr(row, "sdssid") if has_id else k)
-
-        if verbose and (k + 1) % 500 == 0:
-            print(f"[pairs] preprocessed {k + 1:,}/{len(rows):,}")
-
-    arrays = {
-        "mad1": np.asarray(mad1, dtype=np.float32),
-        "mad2": np.asarray(mad2, dtype=np.float32),
-        "valid1": np.asarray(valid1, dtype=bool),
-        "valid2": np.asarray(valid2, dtype=bool),
-        "oiii1": np.asarray(oiii1, dtype=np.float32),
-        "oiii2": np.asarray(oiii2, dtype=np.float32),
-        "rel1": np.asarray(rel1, dtype=bool),
-        "rel2": np.asarray(rel2, dtype=bool),
-        "y": np.asarray(ys, dtype=np.int64),
-        "sdssid": np.asarray(ids),
-        # Representation tag so a stale cache from the other continuum mode is
-        # detected and rebuilt rather than silently reused.
-        "repr_continuum_subtracted": np.asarray(bool(subtract_continuum)),
-    }
-    if verbose:
-        n = len(arrays["y"])
-        print(f"[pairs] preprocessed {n:,} pairs OK, {n_fail:,} failed/missing")
-        print(f"[pairs] labels: static={int((arrays['y'] == 0).sum()):,}  "
-              f"CL-AGN={int((arrays['y'] == 1).sum()):,}")
-    if cache_path:
-        os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
-        np.savez(cache_path, **arrays)
-        if verbose:
-            print(f"[pairs] cached preprocessing -> {cache_path}")
+    if split_filter is not None:
+        df = pd.read_pickle(pkl_path)
+        if "split" in df.columns:
+            keep_ids = set(df[df["split"] == split_filter]["sdssid"].values)
+            keep_mask = np.array([sid in keep_ids for sid in arrays["sdssid"]])
+            if verbose:
+                print(f"[pairs] filtered by split '{split_filter}': kept {keep_mask.sum()} of {len(keep_mask)}")
+            for k in arrays:
+                if k != "repr_continuum_subtracted" and len(np.shape(arrays[k])) > 0:
+                    arrays[k] = arrays[k][keep_mask]
     return arrays
 
 

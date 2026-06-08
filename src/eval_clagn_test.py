@@ -258,6 +258,8 @@ def main():
 
     # ---- read test pickle for the source / metadata columns ------------
     df = pd.read_pickle(pkl_path)
+    if "split" in df.columns:
+        df = df[df["split"] == "test"].reset_index(drop=True)
     print(f"[eval] test pickle: {len(df):,} rows  "
           f"(pos={int((df.label == 1).sum())}, "
           f"neg={int((df.label == 0).sum())})")
@@ -277,6 +279,7 @@ def main():
         cache_path=eval_cache,
         oiii_snr_min=pp["oiii_snr_min"],
         subtract_continuum=False,
+        split_filter="test"
     )
     n = len(arrays["y"])
     print(f"[eval] preprocessed {n:,} pairs  "
@@ -350,6 +353,47 @@ def main():
     labels = np.concatenate(all_labels).ravel().astype(int)
     assert len(probs) == len(df_aligned), \
         f"prob/label length mismatch: {len(probs)} vs {len(df_aligned)}"
+
+    # ---- per-object probability dump (deployment ranking view) --------
+    # The model is a candidate ranker: in deployment you inspect the top-K by
+    # probability. This dump shows the probability every object got (esp. the
+    # CL-AGN positives) and how recall grows with the inspection budget, so the
+    # operating threshold can be chosen at deployment -- NOT tuned on this test.
+    dump = df_aligned.copy()
+    dump["prob"] = probs
+    dump["label"] = labels
+    keep = [c for c in ["sdssid", "source", "z", "ra", "dec",
+                        "specname_dr16", "specname_sdssv"] if c in dump.columns]
+    dump = dump[keep + ["label", "prob"]].sort_values(
+        "prob", ascending=False).reset_index(drop=True)
+    dump["rank"] = np.arange(1, len(dump) + 1)
+    probs_csv = os.path.join(out_dir, "eval_per_object_probs.csv")
+    dump.to_csv(probs_csv, index=False)
+    print(f"\n[eval] wrote per-object probabilities -> {probs_csv}")
+
+    n_pos_total = int((dump["label"] == 1).sum())
+    has_src = "source" in dump.columns
+    pos = dump[dump["label"] == 1]
+    print(f"[eval] CL-AGN positives -- probability & rank (of {len(dump)}):")
+    for _, r in pos.iterrows():
+        src = f"  {str(r['source']):>10s}" if has_src else ""
+        print(f"   rank {int(r['rank']):4d}/{len(dump)}  prob={r['prob']:.3f}"
+              f"  z={r['z']:.3f}{src}")
+    print("[eval] recall vs inspection budget (top-K by probability):")
+    for K in [50, 100, 150, 200, 300, 500]:
+        if K <= len(dump):
+            tp = int(dump["label"].values[:K].sum())
+            line = (f"   top {K:4d}: {tp:3d}/{n_pos_total} positives "
+                    f"(recall {tp / max(n_pos_total, 1):.2f})")
+            if has_src:
+                for s in sorted(dump["source"].dropna().unique()):
+                    if s == "phase2_neg":
+                        continue
+                    msk = dump["source"].values[:K] == s
+                    tp_s = int(dump["label"].values[:K][msk].sum())
+                    tot_s = int((pos["source"] == s).sum())
+                    line += f"  {s}={tp_s}/{tot_s}"
+            print(line)
 
     # ---- overall metrics ----------------------------------------------
     saved = _metrics_at_threshold(probs, labels, saved_threshold, fbeta_beta)
