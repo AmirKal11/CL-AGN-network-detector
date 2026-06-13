@@ -38,28 +38,36 @@ Threshold (0.547) was selected on the validation set by maximising **F₂** subj
   <img src="models/continuum_subtracted_full_DR7/eval_clagn_test.png" alt="PR curve and confusion matrix — fixed OIII model" width="800"/>
 </p>
 
-A separate architecture validation uses the same encoder backbone trained on a supervised Type-1/Type-2 classification task. This network scores **99.5% accuracy** on full spectra, but collapses to **39%** (below the majority-class baseline) when emission lines are masked out — confirming the architecture is capable of learning physically meaningful spectral features rather than calibration artifacts. While this classifier was not used in the final pipeline, it validates that the encoder architecture has the capacity to learn the right signal.
-
-<p align="center">
-  <img src="figures/AGN_classifier_cm_unmasked.png" alt="Type 1/2 classifier — unmasked (99.5% accuracy)" width="45%"/>
-  &nbsp;&nbsp;
-  <img src="figures/AGN_classifier_cm_masked.png" alt="Type 1/2 classifier — emission lines masked (39% accuracy)" width="45%"/>
-</p>
-<p align="center"><em>Left: full spectra — near-perfect classification. Right: emission lines masked — collapses below majority-class baseline, confirming the architecture learns emission line features, not calibration artifacts.</em></p>
+See [What we tried first](#what-we-tried-first-supervised-backbone--synthetic-pairs) for evidence that the encoder architecture learns physically meaningful features, not calibration artifacts.
 
 
 ## Scientific introduction and background
 
-Some galaxies' supermassive black holes visibly **change state over just a few years** — a *changing-look AGN* (CL-AGN). These events are rare (currently estimated to be around 1% to 5% of AGN in samples) and scientifically valuable. We can identify one by comparing two spectra (intensity vs. wavelength) of the **same object** taken years apart: emission features appear or vanish. This is called a transition between Type 1 to Type 2 AGN (or vice versa). They are traditionally confirmed by manually fitting the spectra with different existing models and comparing the derived properties. **The goal of this project is to train a neural network to flag likely CL-AGN transitions directly from paired spectra, reducing the amount of manual fitting required for candidate selection which is time and compute consuming.**
+Some galaxies' supermassive black holes visibly **change state over just a few years** — a *changing-look AGN* (CL-AGN). These events are rare (currently estimated to be around 1% to 5% of AGN in samples) and scientifically valuable. We can identify one by comparing two spectra (intensity vs. wavelength) of the **same object** taken years apart: emission features appear or vanish. This is called a transition between Type 1 to Type 2 AGN (or vice versa). They are traditionally confirmed by manually fitting the spectra with different existing models and comparing the derived properties. Confirmed CL-AGN used as positive labels in this project are sourced from published research papers cataloguing spectroscopic transitions. **The goal of this project is to train a neural network to flag likely CL-AGN transitions directly from paired spectra, reducing the amount of manual fitting required for candidate selection which is time and compute consuming.**
 
 As a machine-learning problem, that's **binary change-detection on pairs (static vs cl-agn)** under three conditions that make it genuinely hard:
 
-- **Heavy class imbalance** — only a few hundred confirmed positives, against tens of thousands of negatives.
-- **Heavy domain shift** — data comes from four different instruments/surveys, each calibrated differently and introducing unique artifacts and noise patterns.
+- **Heavy class imbalance** — 515 confirmed positives against 3,454 negatives in the Siamese training set (~1:7), with no cheap way to generate more positives.
+- **Heavy domain shift** — data comes from four different instruments/surveys (SDSS DR7, DR16, SDSS-V, DESI), each calibrated differently and introducing unique artifacts and noise patterns.
 - **A self-imposed hard constraint** — no line-fitting / spectral-decomposition allowed anywhere; the network has to *learn* the physics that fitting would otherwise hand it.
 
+---
 
+## Dataset composition
 
+<p align="center">
+  <img src="figures/siamese_training_data_distribution.png" alt="Siamese training set distributions" width="900"/>
+</p>
+
+The three panels above characterise the **Siamese training set** (3,969 pairs total). Left: positives (515) are heavily outnumbered by negatives (3,454), distributed across the same redshift range — there is no easy redshift-based shortcut. Centre: both DESI and SDSS-V contribute both positive and negative pairs, but at very different rates — DESI pairs are ~18% positive (434 / 2,461) while SDSS-V pairs are only ~5% positive (81 / 1,508). This asymmetry is the source of the survey-label confound described in [Challenges](#challenges). Right: negatives are overwhelmingly static **Type 1** AGN repeat observations (3,148 of 3,454) — same object, same spectral type, two epochs, no transition. This is the hardest negative class: the model must distinguish "same object, broad lines unchanged" from "same object, broad lines appeared or disappeared."
+
+<p align="center">
+  <img src="figures/ssl_training_data_distribution.png" alt="SSL pool distributions" width="600"/>
+</p>
+
+The two panels above characterise the **SSL pretraining pool** (~82k spectra). SDSS (Sloan Digital Sky Survey) and DESI (Dark Energy Spectroscopic Instrument) are large ground-based telescope surveys that have each observed millions of galaxies; DR7, DR16, and SDSS-V refer to successive public data releases of SDSS, each with different sky coverage, instruments, and calibration pipelines. Left: SDSS DR7 dominates (47,582 of ~82k); SDSS DR16, SDSS-V, and DESI each contribute 10–14k. This imbalance means the encoder's learned representations are biased toward DR7 spectral characteristics — objects observed only by DESI or SDSS-V may fall slightly out of distribution. Right: the pool is ~78% Type 1 / mixed AGN and ~22% Type 2, with Type 2 objects concentrated at low redshift (z < 0.2) where narrow-line AGN are more detectable.
+
+---
 
 ## Technical approach
 
@@ -73,8 +81,30 @@ As a machine-learning problem, that's **binary change-detection on pairs (static
 
 ### Why self-supervised pretraining?
 
-The central bottleneck is label scarcity: a few hundred confirmed CL-AGN against tens of thousands of negatives, with no way to cheaply generate more positives — these are rare real events. Even Type1 / Type2 labels are scarce and depend on catalogues created by other researchers.
+The central bottleneck is label scarcity: 515 confirmed CL-AGN against 3,454 negatives, with no way to cheaply generate more positives — these are rare real events. Even Type 1 / Type 2 labels are scarce and depend on catalogues created by other researchers.
  The solution is to separate *representation learning* from *classification*: a masked autoencoder pretrained on ~80k unlabeled spectra learns a general spectral encoder without ever seeing a label, then a small Siamese head trained on the scarce labeled pairs handles the actual detection. The encoder learns from the data that's abundant; the classifier only needs to learn from what's rare. 
+
+---
+
+### What we tried first: supervised backbone + synthetic pairs
+
+Before adopting self-supervised pretraining, an earlier version trained a convolutional backbone as a **Type 1 / Type 2 spectral classifier**, then constructed *synthetic* CL-AGN pairs by pairing an unrelated Type 1 and Type 2 spectrum from different objects — the idea being that a pair where one spectrum looks like Type 1 and the other looks like Type 2 should resemble a real transition.
+
+Results were poor. Two compounding problems:
+
+- **Synthetic pairs don't capture the real signal.** A genuine CL-AGN transition involves subtle, object-specific changes in specific emission lines against a shared continuum background. Pairing unrelated objects introduces spurious differences — flux level, continuum shape, redshift noise — that swamp the actual transition signal. The model learned to detect "these two objects look spectrally different," not "this object changed."
+- **Domain shift across surveys.** Training data spanned four instruments with different calibrations and noise patterns. The backbone could latch onto instrumental signatures rather than physical line features.
+
+To verify the architecture itself wasn't the bottleneck, the same backbone was tested on a held-out masked evaluation: emission lines were blanked out and the classifier re-evaluated. Accuracy dropped from **99.5% → 39%** (below the majority-class baseline), confirming the network had learned to rely on emission line features — the right signal — rather than calibration artifacts. The problem was the training objective, not the architecture's capacity.
+
+<p align="center">
+  <img src="figures/AGN_classifier_cm_unmasked.png" alt="Type 1/2 classifier — unmasked (99.5% accuracy)" width="45%"/>
+  &nbsp;&nbsp;
+  <img src="figures/AGN_classifier_cm_masked.png" alt="Type 1/2 classifier — emission lines masked (39% accuracy)" width="45%"/>
+</p>
+<p align="center"><em>Left: full spectra — near-perfect classification. Right: emission lines masked — collapses below majority-class baseline, confirming the architecture learns emission line features, not calibration artifacts.</em></p>
+
+This motivated the shift to self-supervised pretraining on unlabeled spectra, which forces the encoder to learn general spectral structure without any class to shortcut on.
 
 ---
 
@@ -97,13 +127,26 @@ The **Siamese head** is trained with **binary focal loss** (α = 0.5, γ = 2) to
 |---|---|---|---|
 | Continuum subtracted + MAD (full DR7) | **88.6%** (31/35) | 2.4% | **0.832** |
 | Raw flux + MAD only (full DR7) | 80.0% (28/35) | 2.6% | 0.812 |
-| Continuum subtracted + SDSS-V weighted SSL loss (full DR7) | TBD | TBD | TBD |
+| Continuum subtracted + SDSS-V weighted SSL loss (full DR7) | in progress | — | — |
 
 Continuum subtraction isolates emission line shapes from the slowly-varying flux baseline, giving the encoder a cleaner signal to reconstruct and the Siamese head a sharper change feature to detect. The 8-point recall difference confirms it is a meaningful preprocessing choice for this task.
 
 ---
 
-`
+## Challenges
+
+### Survey-label confound
+
+Both DESI and SDSS-V contribute positive and negative pairs, but at very different rates: **DESI pairs are ~18% positive** (434 / 2,461) while **SDSS-V pairs are only ~5% positive** (81 / 1,508). A model could exploit this asymmetry by learning "DESI-style spectral characteristics → higher score" rather than detecting actual line transitions — reaching good accuracy without ever learning any physics. To catch this, every checkpoint was evaluated with a **per-survey breakdown**: if DESI pairs scored systematically higher than SDSS-V pairs *within the same label class*, the model was shortcutting on instrument identity. Monitoring this split throughout training was essential to trust the final results.
+
+A structural gap remains: DESI negatives are underrepresented relative to DESI positives. Acquiring more same-survey DESI negative pairs would be the highest-leverage data addition for future work.
+
+### SSL bias
+
+Partly as a consequence of the above, the encoder trained on the full DR7 SSL pool is biased toward SDSS DR7 spectral characteristics. Objects observed only by DESI or SDSS-V may fall slightly out of distribution for the encoder. This is tracked but not yet resolved.
+
+---
+
 ## Repository layout
 
 ```
@@ -118,7 +161,6 @@ src/
   datasets_v2.py            # SSL + real-pair datasets, pair-array cache
   preprocessing_oiii.py     # 2-channel representation, line anchor, masking, rest-frame grid
   data_preprocessing.py     # FITS → arrays, sky-line removal, SNR cut, continuum
-  (v1 backbone — see TECHNICAL.md §3)
 config_v2.yml               # pipeline config (paths + hyperparameters)
 models/
   continuum_subtracted_full_dr7/  # best model (PR-AUC 0.832) — checkpoints + eval artifacts
