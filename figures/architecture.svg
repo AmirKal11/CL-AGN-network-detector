@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 840" font-family="Arial, Helvetica, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto">
+      <path d="M0,0 L7,3.2 L0,6.4 Z" fill="#475569"/>
+    </marker>
+    <marker id="arrowd" markerWidth="9" markerHeight="9" refX="7" refY="3.2" orient="auto">
+      <path d="M0,0 L7,3.2 L0,6.4 Z" fill="#2563eb"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1120" height="840" fill="#ffffff"/>
+  <text x="560" y="36" text-anchor="middle" font-size="23" font-weight="bold" fill="#0f172a">Two-stage CL-AGN change detector</text>
+  <text x="560" y="56" text-anchor="middle" font-size="13" fill="#64748b">Self-supervised encoder, transferred and frozen into a symmetric Siamese change head</text>
+
+  <!-- ================= STAGE 1 ================= -->
+  <rect x="24" y="68" width="1072" height="290" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="44" y="94" font-size="15" font-weight="bold" fill="#334155">Stage 1 — Self-supervised masked-reconstruction pretraining</text>
+  <text x="44" y="113" font-size="12.5" fill="#64748b">unlabeled spectra (~44k–53k, DR7 + DESI [+ DR16 + SDSS-V])  ·  no labels</text>
+
+  <!-- boxes -->
+  <rect x="48" y="160" width="156" height="120" rx="8" fill="#eef2f7" stroke="#94a3b8"/>
+  <text x="126" y="206" text-anchor="middle" font-size="13" fill="#1e293b">
+    <tspan x="126" font-weight="bold">Input spectrum</tspan>
+    <tspan x="126" dy="20">[2 × 4096]</tspan>
+    <tspan x="126" dy="18">MAD + [OIII]</tspan>
+    <tspan x="126" dy="18">channels</tspan>
+  </text>
+
+  <rect x="242" y="160" width="150" height="120" rx="8" fill="#eef2f7" stroke="#94a3b8"/>
+  <text x="317" y="210" text-anchor="middle" font-size="13" fill="#1e293b">
+    <tspan x="317" font-weight="bold">Span masking</tspan>
+    <tspan x="317" dy="20">mask 50%</tspan>
+    <tspan x="317" dy="18">spans 64–384 px</tspan>
+  </text>
+
+  <rect x="430" y="150" width="184" height="140" rx="8" fill="#bfdbfe" stroke="#2563eb" stroke-width="2"/>
+  <text x="522" y="196" text-anchor="middle" font-size="13" fill="#1e3a8a">
+    <tspan x="522" font-weight="bold" font-size="14">SpectraEncoder</tspan>
+    <tspan x="522" dy="20">multi-scale 1-D CNN</tspan>
+    <tspan x="522" dy="18">+ transformer</tspan>
+    <tspan x="522" dy="18">→ 512-d embedding</tspan>
+  </text>
+
+  <rect x="652" y="160" width="150" height="120" rx="8" fill="#eef2f7" stroke="#94a3b8"/>
+  <text x="727" y="210" text-anchor="middle" font-size="13" fill="#1e293b">
+    <tspan x="727" font-weight="bold">SpectraDecoder</tspan>
+    <tspan x="727" dy="20">(SSL only,</tspan>
+    <tspan x="727" dy="18">discarded after)</tspan>
+  </text>
+
+  <rect x="840" y="160" width="176" height="120" rx="8" fill="#eef2f7" stroke="#94a3b8"/>
+  <text x="928" y="206" text-anchor="middle" font-size="13" fill="#1e293b">
+    <tspan x="928" font-weight="bold">Reconstruction</tspan>
+    <tspan x="928" dy="20">MSE on masked</tspan>
+    <tspan x="928" dy="18">+ covered</tspan>
+    <tspan x="928" dy="18">pixels</tspan>
+  </text>
+
+  <!-- stage 1 arrows -->
+  <line x1="204" y1="220" x2="240" y2="220" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="392" y1="220" x2="428" y2="220" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="614" y1="220" x2="650" y2="220" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="802" y1="220" x2="838" y2="220" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- ================= TRANSFER ================= -->
+  <path d="M522,290 L522,330 L300,330 L300,470" fill="none" stroke="#2563eb" stroke-width="2.2" stroke-dasharray="7 5" marker-end="url(#arrowd)"/>
+  <rect x="372" y="318" width="300" height="26" rx="13" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="522" y="335" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#1e3a8a">transfer encoder weights, then FREEZE</text>
+
+  <!-- ================= STAGE 2 ================= -->
+  <rect x="24" y="386" width="1072" height="430" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="44" y="412" font-size="15" font-weight="bold" fill="#334155">Stage 2 — Frozen-encoder Siamese change detector</text>
+  <text x="44" y="431" font-size="12.5" fill="#64748b">real same-object epoch pairs (~470 positives + ~16k negatives)  ·  only the head is trained</text>
+
+  <!-- inputs -->
+  <rect x="48" y="476" width="150" height="74" rx="8" fill="#eef2f7" stroke="#94a3b8"/>
+  <text x="123" y="508" text-anchor="middle" font-size="13" fill="#1e293b">
+    <tspan x="123" font-weight="bold">Epoch A</tspan>
+    <tspan x="123" dy="19">[2 × 4096]</tspan>
+  </text>
+  <rect x="48" y="668" width="150" height="74" rx="8" fill="#eef2f7" stroke="#94a3b8"/>
+  <text x="123" y="700" text-anchor="middle" font-size="13" fill="#1e293b">
+    <tspan x="123" font-weight="bold">Epoch B</tspan>
+    <tspan x="123" dy="19">[2 × 4096]</tspan>
+  </text>
+
+  <!-- shared encoders -->
+  <rect x="244" y="472" width="180" height="82" rx="8" fill="#bfdbfe" stroke="#2563eb" stroke-width="2"/>
+  <text x="334" y="505" text-anchor="middle" font-size="13" fill="#1e3a8a">
+    <tspan x="334" font-weight="bold">SpectraEncoder</tspan>
+    <tspan x="334" dy="18" font-size="11.5">frozen, shared weights</tspan>
+  </text>
+  <rect x="244" y="664" width="180" height="82" rx="8" fill="#bfdbfe" stroke="#2563eb" stroke-width="2"/>
+  <text x="334" y="697" text-anchor="middle" font-size="13" fill="#1e3a8a">
+    <tspan x="334" font-weight="bold">SpectraEncoder</tspan>
+    <tspan x="334" dy="18" font-size="11.5">frozen, shared weights</tspan>
+  </text>
+  <line x1="334" y1="554" x2="334" y2="664" stroke="#2563eb" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <text x="344" y="612" font-size="11" fill="#2563eb">shared</text>
+
+  <!-- embeddings -->
+  <text x="452" y="508" font-size="14" fill="#1e293b" font-style="italic">e₁ ∈ ℝ⁵¹²</text>
+  <text x="452" y="700" font-size="14" fill="#1e293b" font-style="italic">e₂ ∈ ℝ⁵¹²</text>
+
+  <!-- fusion -->
+  <rect x="544" y="540" width="236" height="138" rx="8" fill="#d1fae5" stroke="#059669" stroke-width="2"/>
+  <text x="662" y="580" text-anchor="middle" font-size="13" fill="#064e3b">
+    <tspan x="662" font-weight="bold">Symmetric fusion</tspan>
+    <tspan x="662" dy="24" font-size="13">[ e₁+e₂ , |e₁−e₂| , e₁·e₂ ]</tspan>
+    <tspan x="662" dy="22">→ ℝ¹⁵³⁶</tspan>
+    <tspan x="662" dy="20" font-size="11.5" fill="#047857">epoch-order invariant</tspan>
+  </text>
+
+  <!-- head -->
+  <rect x="806" y="568" width="150" height="82" rx="8" fill="#fde68a" stroke="#d97706" stroke-width="2"/>
+  <text x="881" y="600" text-anchor="middle" font-size="13" fill="#78350f">
+    <tspan x="881" font-weight="bold">MLP head</tspan>
+    <tspan x="881" dy="19">1536→512→128→1</tspan>
+  </text>
+
+  <!-- output -->
+  <rect x="980" y="572" width="112" height="74" rx="8" fill="#e9d5ff" stroke="#7c3aed" stroke-width="2"/>
+  <text x="1036" y="603" text-anchor="middle" font-size="13" fill="#4c1d95">
+    <tspan x="1036" font-weight="bold">P(change)</tspan>
+    <tspan x="1036" dy="19" font-size="12">= σ(logit)</tspan>
+  </text>
+
+  <!-- stage 2 arrows -->
+  <line x1="198" y1="513" x2="242" y2="513" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="198" y1="705" x2="242" y2="705" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <path d="M424,513 L500,513 L500,588 L542,588" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <path d="M424,705 L500,705 L500,632 L542,632" fill="none" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="780" y1="609" x2="804" y2="609" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="956" y1="609" x2="978" y2="609" stroke="#475569" stroke-width="2" marker-end="url(#arrow)"/>
+</svg>
