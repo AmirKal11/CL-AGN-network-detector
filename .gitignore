@@ -23,5 +23,6 @@ venv/
 Thumbs.db
 
 # ── Local-only (not for public repo) ────────────────────────────────────────
-docs/
+docs/HANDOFF.md
+docs/PIPELINE.md
 TECHNICAL.md
