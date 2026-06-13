@@ -171,21 +171,35 @@ Continuum subtraction isolates emission line shapes from the slowly-varying flux
 
 ```
 src/
-  predict.py                # ← inference on new data (see below)
-  pretrain_ssl.py           # Stage 1 — self-supervised pretraining
-  train_siamese_v2.py       # Stage 2 — frozen-encoder Siamese, recall-first selection
-  eval_clagn_test.py        # held-out eval: per-source / per-redshift / per-object ranking
-  gradcam_pairs.py          # input-gradient visualisation: TP/FP/TN/FN pair plots
-  plot_ssl_reconstruction.py# SSL reconstruction diagnostic (both channels)
-  architectures_v2.py       # SpectraEncoder, MaskedSpectraAutoencoder, SiameseChangeNet
-  datasets_v2.py            # SSL + real-pair datasets, pair-array cache
-  preprocessing_oiii.py     # 2-channel representation, line anchor, masking, rest-frame grid
-  data_preprocessing.py     # FITS → arrays, sky-line removal, SNR cut, continuum
-config_v2.yml               # pipeline config (paths + hyperparameters)
+  predict.py                 # ← inference on new data (see below)
+  pretrain_ssl.py            # Stage 1 — self-supervised pretraining
+  train_siamese_v2.py        # Stage 2 — frozen-encoder Siamese, recall-first selection
+  eval_clagn_test.py         # held-out eval: per-source / per-redshift / per-object ranking
+  gradcam_pairs.py           # input-gradient visualisation: TP/FP/TN/FN pair plots
+  plot_ssl_reconstruction.py # SSL reconstruction diagnostic (both channels)
+  architectures_v2.py        # SpectraEncoder, MaskedSpectraAutoencoder, SiameseChangeNet
+  architectures.py           # SpectraBlock and TransformerStage building blocks
+  datasets_v2.py             # SSL + real-pair datasets, pair-array cache
+  preprocessing_oiii.py      # 2-channel representation, line anchor, masking, rest-frame grid
+  data_preprocessing.py      # FITS → arrays, sky-line removal, SNR cut, continuum subtraction
+  train_classifier.py        # Type 1/2 supervised classifier (pre-SSL baseline)
+figures/
+  architecture.svg           # two-stage pipeline overview
+  encoder_architecture.svg   # SpectraEncoder layer-by-layer with tensor shapes
+  AGN_classifier_cm_*.png    # masked / unmasked confusion matrices (pre-SSL baseline)
+  siamese_training_data_distribution.png
+  ssl_training_data_distribution.png
+docs/
+  PIPELINE.md                # end-to-end pipeline walkthrough
+  DATA_INVENTORY.md          # data sources, counts, and file locations
+  HANDOFF.md                 # project context and design decisions
+  SPECTRA_PATH.md            # spectra directory layout
+config_v2.yml                # pipeline config (paths + hyperparameters)
+requirements.txt
 models/
   continuum_subtracted_full_dr7/  # best model (PR-AUC 0.832) — checkpoints + eval artifacts
   raw_continuum_full_dr7/         # ablation: no continuum subtraction (PR-AUC 0.812)
-  raw_continuum_dr7_capped/       # ablation: capped DR7 SSL pool
+  raw_continuum_dr7_capped/       # ablation: capped DR7 SSL pool (worse than full)
   sdssv_weighted/                 # ablation: SDSS-V/DR16 ×3 weighted SSL loss (PR-AUC 0.842)
 ```
 
