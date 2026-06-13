@@ -3,7 +3,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-MPS-EE4C2C?logo=pytorch&logoColor=white)
 ![Self-Supervised](https://img.shields.io/badge/Self--Supervised-Masked%20Autoencoder-5C2D91)
-![Siamese](https://img.shields.io/badge/Architecture-Siamese%20%2B%20Transformer-0A7E8C)
+![Siamese](https://img.shields.io/badge/Architecture-Siamese%20%2B%201D%20Conv%20%2B%20Attention-0A7E8C)
 ![Domain](https://img.shields.io/badge/Domain-Astrophysics%20%2F%20Spectroscopy-1f6feb)
 
 A two-stage deep-learning pipeline that detects a rare astrophysical **state-transition** from pairs of telescope spectra from different surveys — built around **self-supervised pretraining, used for spectra reconstruction**, a **frozen-encoder Siamese head**, and a dynamic per-survey evaluation to detect shortcut learning / data imbalance. Trained on ~85k spectra and reached **PR-AUC 0.832** and **ROC-AUC 0.984**.
@@ -32,10 +32,10 @@ In ML terms, this is a rare-event binary change-detection system trained on pair
 | **Recall** at operating threshold | **88.6%** (31 / 35 confirmed CL-AGN) |
 | **FPR** at operating threshold | **2.4%** (17 / 700 non-CL-AGN flagged) |
 
-Threshold (0.547) was selected on the validation set by maximising **F₂** subject to FPR ≤ 5%, then applied to the held-out test set without modification. This operating point prioritises recovering likely CL-AGN candidates while keeping the false-positive rate low enough for manual follow-up.
+The best model checkpoint was selected by **validation PR-AUC**. The operating threshold (0.547) was then chosen on that checkpoint's validation outputs by maximising **F₂** subject to FPR ≤ 5%, and applied to the held-out test set without modification. This operating point prioritises recovering likely CL-AGN candidates while keeping the false-positive rate low enough for manual follow-up.
 
 <p align="center">
-  <img src="models/continuum_subtracted_full_DR7/eval_clagn_test.png" alt="PR curve and confusion matrix — fixed OIII model" width="800"/>
+  <img src="models/continuum_subtracted_full_dr7/eval_clagn_test.png" alt="PR curve and confusion matrix — fixed OIII model" width="800"/>
 </p>
 
 See [What we tried first](#what-we-tried-first-supervised-backbone--synthetic-pairs) for evidence that the encoder architecture learns physically meaningful features, not calibration artifacts.
@@ -71,11 +71,15 @@ The two panels above characterise the **SSL pretraining pool** (~82k spectra). S
 
 ## Technical approach
 
-![Two-stage architecture: SSL pretraining, frozen encoder, Siamese change head](figures/architecture.svg)
+![Two-stage architecture: SSL pretraining, frozen 1D-conv encoder with attention, Siamese change head](figures/architecture.svg)
 
-**Stage 1 — self-supervised encoder.** Random spans of unlabeled spectra are masked and reconstructed (a 1-D masked autoencoder). Label-free, so there's no class to shortcut on. The decoder is discarded; the **512-dim encoder** is kept.
+The diagram below shows the SpectraEncoder layer-by-layer, with tensor shapes at each stage:
 
-**Stage 2 — frozen-encoder Siamese head.** The encoder is frozen and applied to both epochs; only a small MLP change-head is trained on real same-object pairs. Freezing is what lets a few hundred positives be fit without overfitting or amplifying instrument-correlated features.
+![SpectraEncoder layer-by-layer architecture](figures/encoder_architecture.svg)
+
+**Stage 1 — self-supervised encoder.** At each training step, random contiguous spans of an unlabeled spectrum are zeroed out, and the network must reconstruct the original flux at those positions. The loss is a weighted MSE — emission-line regions can be upweighted to force the encoder to pay attention to line structure, not just the smooth continuum. Because the task is self-supervised, no labels are needed; the encoder learns what a spectrum "should look like" purely from the data. The encoder is a **1D convolutional network with attention heads and a spatial aggregation layer**, producing a 512-dim embedding per spectrum. After pretraining, the decoder is discarded and only this encoder is kept.
+
+**Stage 2 — frozen-encoder Siamese head.** The encoder is frozen and applied to both epochs; only a small MLP change-head is trained on real same-object pairs. Freezing is what lets a few hundred positives be fit without overfitting or amplifying instrument-correlated features. Input-gradient maps showing which wavelength regions drive each prediction are in [Example outputs](#example-outputs).
 
 **Input representation.** Each spectrum becomes a 2-channel, 4096-px rest-frame array: a robustly-normalized flux channel plus a channel anchored to a physically *constant* emission line (so a real cross-epoch change survives normalization instead of being divided away). Both arcsinh-compressed.
 
@@ -117,21 +121,9 @@ Each spectrum pair is converted to a **2-channel, 4096-pixel rest-frame array** 
 
 Both channels are arcsinh-compressed to handle the dynamic range of emission-line spikes.
 
-The **Siamese head** is trained with **binary focal loss** (α = 0.5, γ = 2) to down-weight the large number of easy negatives in the heavily imbalanced dataset (≈ 1:7 positive ratio after oversampling). The batch sampler targets **30% positives per batch** (oversampled), and the AdamW head learning rate is 1 × 10⁻³ over 40 epochs with cosine annealing. The encoder is frozen throughout Stage 2, so only the ≈ 500k-parameter MLP head is updated. Checkpoint selection uses **F₂** (which weights recall twice as heavily as precision) — matching the deployment goal of surfacing a short candidate list for human inspection rather than maximising purity.
+The **Siamese head** is trained with **binary focal loss** (α = 0.5, γ = 2) to down-weight the large number of easy negatives in the heavily imbalanced dataset (≈ 1:7 positive ratio after oversampling). The batch sampler targets **30% positives per batch** (oversampled), and the AdamW head learning rate is 1 × 10⁻³ over 40 epochs with cosine annealing. The encoder is frozen throughout Stage 2, so only the ≈ 500k-parameter MLP head is updated. Checkpoint selection uses the **mean per-survey PR-AUC** (each survey weighted equally). The operating threshold is then chosen on the validation set by maximising **F₂** subject to FPR ≤ 5% — weighting recall twice as heavily as precision to match the deployment goal of surfacing a short candidate list for human inspection.
 
-### Testing various datasets and data preprocessing
 
-**Continuum subtraction in ch0.** Two runs were compared — identical architecture, data, and hyperparameters, differing only in whether the smooth continuum was subtracted from ch0 before MAD normalisation:
-
-| Configuration | Recall | FPR | PR-AUC |
-|---|---|---|---|
-| Continuum subtracted + MAD (full DR7) | **88.6%** (31/35) | 2.4% | **0.832** |
-| Raw flux + MAD only (full DR7) | 80.0% (28/35) | 2.6% | 0.812 |
-| Continuum subtracted + SDSS-V weighted SSL loss (full DR7) | in progress | — | — |
-
-Continuum subtraction isolates emission line shapes from the slowly-varying flux baseline, giving the encoder a cleaner signal to reconstruct and the Siamese head a sharper change feature to detect. The 8-point recall difference confirms it is a meaningful preprocessing choice for this task.
-
----
 
 ## Challenges
 
@@ -149,9 +141,31 @@ The SSL pool is dominated by SDSS DR7 (~58% of spectra), so the encoder is bette
   <img src="models/continuum_subtracted_full_dr7/ssl_loss_curve.png" alt="SSL pretraining loss — train, global val, and SDSS-V+DR16 val" width="650"/>
 </p>
 
-Checkpoint selection used the SDSS-V + DR16 validation loss (green) rather than the global loss as the selection criterion — this is a more honest signal for how the encoder will generalise to the surveys most relevant to the Siamese head. To directly address the DR7 dominance, an ablation capped the DR7 contribution to the SSL pool. Downstream Siamese performance was actually worse: the encoder benefits from the volume of DR7 data even at the cost of some survey bias, likely because the additional spectra improve the quality of the learned spectral representations overall. The bias is therefore acknowledged but accepted as a current limitation.
+Checkpoint selection used the SDSS-V + DR16 validation loss (green) rather than the global loss as the selection criterion — this is a more honest signal for how the encoder will generalise to the surveys most relevant to the Siamese head.
+
+Two strategies were tested to directly address the DR7 dominance:
+
+**Capping DR7 at 24k spectra.** Reducing DR7's share of the SSL pool hurt performance — the encoder benefits from the volume of DR7 data even at the cost of some survey bias, likely because the additional spectra improve the quality of learned spectral representations overall.
+
+**Survey-weighted SSL loss (SDSS-V and DR16 upweighted 3×).** Rather than removing DR7 data, this run kept the full pool but gave SDSS-V and DR16 spectra 3× more gradient signal during pretraining. PR-AUC improved marginally (0.832 → 0.842), confirming the ranking quality was at least maintained. However, recall at the operating threshold dropped significantly (88.6% → 62.9%), with FPR falling to 0.4%. This suggests the weighting shifted the score distribution — the val-derived threshold no longer matched the test set — rather than producing a genuinely better model. The unweighted run remains the best overall result.
+
+The DR7 bias is therefore acknowledged but accepted as a current limitation.
 
 ---
+
+### Ablation: preprocessing choices
+
+**Continuum subtraction in ch0.** Two runs were compared — identical architecture, data, and hyperparameters, differing only in whether the smooth continuum was subtracted from ch0 before MAD normalisation:
+
+| Configuration | Recall | FPR | PR-AUC |
+|---|---|---|---|
+| Continuum subtracted + MAD (full DR7) | **88.6%** (31/35) | 2.4% | **0.832** |
+| Raw flux + MAD only (full DR7) | 80.0% (28/35) | 2.6% | 0.812 |
+| Continuum subtracted + SDSS-V/DR16 weighted SSL loss (full DR7) | 62.9% (22/35) | 0.4% | 0.842 |
+
+Continuum subtraction isolates emission line shapes from the slowly-varying flux baseline, giving the encoder a cleaner signal to reconstruct and the Siamese head a sharper change feature to detect. The 8-point recall difference confirms it is a meaningful preprocessing choice for this task. 
+
+
 
 ## Repository layout
 
@@ -172,6 +186,7 @@ models/
   continuum_subtracted_full_dr7/  # best model (PR-AUC 0.832) — checkpoints + eval artifacts
   raw_continuum_full_dr7/         # ablation: no continuum subtraction (PR-AUC 0.812)
   raw_continuum_dr7_capped/       # ablation: capped DR7 SSL pool
+  sdssv_weighted/                 # ablation: SDSS-V/DR16 ×3 weighted SSL loss (PR-AUC 0.842)
 ```
 
 
@@ -211,13 +226,7 @@ python src/gradcam_pairs.py --config config_v2.yml   # interpretability plots
 **SSL reconstruction (Stage 1).** The masked autoencoder learns to reconstruct randomly-masked spans — shown here for both input channels (MAD-normalised flux and OIII-anchored amplitude):
 
 <p align="center">
-  <img src="models/continuum_subtracted_full_dr7/ssl_reconstruction_ch1.png" alt="SSL reconstruction — channel 0" width="700"/>
-</p>
-
-**Siamese training curve (Stage 2):**
-
-<p align="center">
-  <img src="models/continuum_subtracted_full_dr7/siamese_loss_curve.png" alt="Siamese training / validation loss" width="500"/>
+  <img src="models/continuum_subtracted_full_dr7/ssl_reconstruction_ch1.png" alt="SSL reconstruction — channel 1 (OIII-anchored)" width="700"/>
 </p>
 
 **Input-gradient interpretability.** Each spectrum is coloured by the signed gradient of the CL-AGN logit with respect to the flux at that wavelength. Red regions pushed the prediction toward CL-AGN; blue pushed against it. Example true positive and false positive — in the FP case the model focuses on Hα at the red edge, where coverage drops and broad-wing structure is hard to rule out:

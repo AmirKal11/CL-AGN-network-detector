@@ -1,0 +1,267 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 820" font-family="Arial, Helvetica, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#475569"/>
+    </marker>
+    <marker id="arrb" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrg" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#059669"/>
+    </marker>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="1000" height="820" fill="#ffffff"/>
+
+  <!-- title -->
+  <text x="500" y="34" text-anchor="middle" font-size="20" font-weight="bold" fill="#0f172a">SpectraEncoder — Layer-by-layer architecture</text>
+  <text x="500" y="54" text-anchor="middle" font-size="12" fill="#64748b">Input: [B, 2, 4096]  →  Output: [B, 512]</text>
+
+  <!-- ===== INPUT ===== -->
+  <rect x="30" y="76" width="110" height="64" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="85" y="103" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e293b">Input</text>
+  <text x="85" y="120" text-anchor="middle" font-size="11" fill="#475569">[B, 2, 4096]</text>
+  <text x="85" y="135" text-anchor="middle" font-size="10" fill="#64748b">2-ch spectrum</text>
+
+  <!-- arrow -->
+  <line x1="140" y1="108" x2="162" y2="108" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <!-- ===== SPECTRABLOCK 1 ===== -->
+  <!-- outer box -->
+  <rect x="164" y="68" width="200" height="300" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text x="264" y="88" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e3a8a">SpectraBlock 1</text>
+  <text x="264" y="103" text-anchor="middle" font-size="10" fill="#3b82f6">ch 2 → 64</text>
+
+  <!-- 3 parallel branches -->
+  <!-- branch 1 -->
+  <rect x="175" y="115" width="52" height="36" rx="5" fill="#bfdbfe" stroke="#3b82f6"/>
+  <text x="201" y="129" text-anchor="middle" font-size="9" font-weight="bold" fill="#1e3a8a">Conv1d</text>
+  <text x="201" y="141" text-anchor="middle" font-size="9" fill="#1e3a8a">k=3</text>
+
+  <!-- branch 2 -->
+  <rect x="238" y="115" width="52" height="36" rx="5" fill="#bfdbfe" stroke="#3b82f6"/>
+  <text x="264" y="129" text-anchor="middle" font-size="9" font-weight="bold" fill="#1e3a8a">Conv1d</text>
+  <text x="264" y="141" text-anchor="middle" font-size="9" fill="#1e3a8a">k=15</text>
+
+  <!-- branch 3 -->
+  <rect x="301" y="115" width="52" height="36" rx="5" fill="#bfdbfe" stroke="#3b82f6"/>
+  <text x="327" y="126" text-anchor="middle" font-size="9" font-weight="bold" fill="#1e3a8a">Conv1d</text>
+  <text x="327" y="137" text-anchor="middle" font-size="9" fill="#1e3a8a">k=31</text>
+  <text x="327" y="148" text-anchor="middle" font-size="8" fill="#3b82f6">dil=2</text>
+
+  <!-- concat -->
+  <rect x="195" y="170" width="138" height="28" rx="5" fill="#dbeafe" stroke="#3b82f6"/>
+  <text x="264" y="189" text-anchor="middle" font-size="10" fill="#1e3a8a">concat → [B, 192, L]</text>
+
+  <!-- fusion conv -->
+  <rect x="210" y="214" width="108" height="28" rx="5" fill="#bfdbfe" stroke="#3b82f6"/>
+  <text x="264" y="228" text-anchor="middle" font-size="9" font-weight="bold" fill="#1e3a8a">Conv1d 192→64, k=1</text>
+  <text x="264" y="238" text-anchor="middle" font-size="8.5" fill="#1e3a8a">GroupNorm · GELU</text>
+
+  <!-- residual shortcut label -->
+  <text transform="rotate(-90,164,194)" x="164" y="194" text-anchor="middle" font-size="8" fill="#6366f1" font-style="italic">residual (1×1 conv)</text>
+  <path d="M172,108 L172,280 L210,280" fill="none" stroke="#6366f1" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arrg)"/>
+
+  <!-- add + dropout -->
+  <rect x="210" y="268" width="108" height="28" rx="5" fill="#bfdbfe" stroke="#3b82f6"/>
+  <text x="264" y="281" text-anchor="middle" font-size="9" font-weight="bold" fill="#1e3a8a">Add + Dropout1d(0.15)</text>
+  <text x="264" y="292" text-anchor="middle" font-size="8.5" fill="#1e3a8a">[B, 64, 4096]</text>
+
+  <!-- maxpool -->
+  <rect x="210" y="312" width="108" height="28" rx="5" fill="#dbeafe" stroke="#3b82f6"/>
+  <text x="264" y="325" text-anchor="middle" font-size="9" font-weight="bold" fill="#1e3a8a">MaxPool1d(2)</text>
+  <text x="264" y="337" text-anchor="middle" font-size="8.5" fill="#1e3a8a">[B, 64, 2048]</text>
+
+  <!-- internal arrows block1 -->
+  <line x1="201" y1="151" x2="201" y2="168" stroke="#3b82f6" stroke-width="1.2" marker-end="url(#arrb)"/>
+  <line x1="264" y1="151" x2="264" y2="168" stroke="#3b82f6" stroke-width="1.2" marker-end="url(#arrb)"/>
+  <line x1="327" y1="151" x2="327" y2="168" stroke="#3b82f6" stroke-width="1.2" marker-end="url(#arrb)"/>
+  <line x1="264" y1="198" x2="264" y2="212" stroke="#3b82f6" stroke-width="1.2" marker-end="url(#arrb)"/>
+  <line x1="264" y1="242" x2="264" y2="266" stroke="#3b82f6" stroke-width="1.2" marker-end="url(#arrb)"/>
+  <line x1="264" y1="296" x2="264" y2="310" stroke="#3b82f6" stroke-width="1.2" marker-end="url(#arrb)"/>
+
+  <!-- output label below block1 -->
+  <text x="264" y="384" text-anchor="middle" font-size="11" font-weight="bold" fill="#1e3a8a">[B, 64, 2048]</text>
+
+  <!-- arrow to block2 -->
+  <line x1="364" y1="326" x2="386" y2="326" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <!-- ===== SPECTRABLOCK 2 ===== -->
+  <rect x="388" y="68" width="200" height="300" rx="10" fill="#f0fdf4" stroke="#059669" stroke-width="2"/>
+  <text x="488" y="88" text-anchor="middle" font-size="12" font-weight="bold" fill="#065f46">SpectraBlock 2</text>
+  <text x="488" y="103" text-anchor="middle" font-size="10" fill="#10b981">ch 64 → 128</text>
+
+  <rect x="399" y="115" width="52" height="36" rx="5" fill="#bbf7d0" stroke="#059669"/>
+  <text x="425" y="129" text-anchor="middle" font-size="9" font-weight="bold" fill="#065f46">Conv1d</text>
+  <text x="425" y="141" text-anchor="middle" font-size="9" fill="#065f46">k=3</text>
+
+  <rect x="462" y="115" width="52" height="36" rx="5" fill="#bbf7d0" stroke="#059669"/>
+  <text x="488" y="129" text-anchor="middle" font-size="9" font-weight="bold" fill="#065f46">Conv1d</text>
+  <text x="488" y="141" text-anchor="middle" font-size="9" fill="#065f46">k=11</text>
+
+  <rect x="525" y="115" width="52" height="36" rx="5" fill="#bbf7d0" stroke="#059669"/>
+  <text x="551" y="126" text-anchor="middle" font-size="9" font-weight="bold" fill="#065f46">Conv1d</text>
+  <text x="551" y="137" text-anchor="middle" font-size="9" fill="#065f46">k=21</text>
+  <text x="551" y="148" text-anchor="middle" font-size="8" fill="#059669">dil=2</text>
+
+  <rect x="419" y="170" width="138" height="28" rx="5" fill="#dcfce7" stroke="#059669"/>
+  <text x="488" y="189" text-anchor="middle" font-size="10" fill="#065f46">concat → [B, 384, L]</text>
+
+  <rect x="434" y="214" width="108" height="28" rx="5" fill="#bbf7d0" stroke="#059669"/>
+  <text x="488" y="228" text-anchor="middle" font-size="9" font-weight="bold" fill="#065f46">Conv1d 384→128, k=1</text>
+  <text x="488" y="238" text-anchor="middle" font-size="8.5" fill="#065f46">GroupNorm · GELU</text>
+
+  <text transform="rotate(-90,388,194)" x="388" y="194" text-anchor="middle" font-size="8" fill="#6366f1" font-style="italic">residual (1×1 conv)</text>
+  <path d="M396,108 L396,280 L434,280" fill="none" stroke="#6366f1" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arrg)"/>
+
+  <rect x="434" y="268" width="108" height="28" rx="5" fill="#bbf7d0" stroke="#059669"/>
+  <text x="488" y="281" text-anchor="middle" font-size="9" font-weight="bold" fill="#065f46">Add + Dropout1d(0.15)</text>
+  <text x="488" y="292" text-anchor="middle" font-size="8.5" fill="#065f46">[B, 128, 2048]</text>
+
+  <rect x="434" y="312" width="108" height="28" rx="5" fill="#dcfce7" stroke="#059669"/>
+  <text x="488" y="325" text-anchor="middle" font-size="9" font-weight="bold" fill="#065f46">MaxPool1d(2)</text>
+  <text x="488" y="337" text-anchor="middle" font-size="8.5" fill="#065f46">[B, 128, 1024]</text>
+
+  <line x1="425" y1="151" x2="425" y2="168" stroke="#059669" stroke-width="1.2" marker-end="url(#arrg)"/>
+  <line x1="488" y1="151" x2="488" y2="168" stroke="#059669" stroke-width="1.2" marker-end="url(#arrg)"/>
+  <line x1="551" y1="151" x2="551" y2="168" stroke="#059669" stroke-width="1.2" marker-end="url(#arrg)"/>
+  <line x1="488" y1="198" x2="488" y2="212" stroke="#059669" stroke-width="1.2" marker-end="url(#arrg)"/>
+  <line x1="488" y1="242" x2="488" y2="266" stroke="#059669" stroke-width="1.2" marker-end="url(#arrg)"/>
+  <line x1="488" y1="296" x2="488" y2="310" stroke="#059669" stroke-width="1.2" marker-end="url(#arrg)"/>
+
+  <text x="488" y="384" text-anchor="middle" font-size="11" font-weight="bold" fill="#065f46">[B, 128, 1024]</text>
+
+  <!-- arrow to block3 -->
+  <line x1="588" y1="326" x2="610" y2="326" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <!-- ===== SPECTRABLOCK 3 ===== -->
+  <rect x="612" y="68" width="200" height="290" rx="10" fill="#fdf4ff" stroke="#9333ea" stroke-width="2"/>
+  <text x="712" y="88" text-anchor="middle" font-size="12" font-weight="bold" fill="#581c87">SpectraBlock 3</text>
+  <text x="712" y="103" text-anchor="middle" font-size="10" fill="#a855f7">ch 128 → 256  ·  no pool</text>
+
+  <rect x="623" y="115" width="52" height="36" rx="5" fill="#f3e8ff" stroke="#9333ea"/>
+  <text x="649" y="129" text-anchor="middle" font-size="9" font-weight="bold" fill="#581c87">Conv1d</text>
+  <text x="649" y="141" text-anchor="middle" font-size="9" fill="#581c87">k=3</text>
+
+  <rect x="686" y="115" width="52" height="36" rx="5" fill="#f3e8ff" stroke="#9333ea"/>
+  <text x="712" y="129" text-anchor="middle" font-size="9" font-weight="bold" fill="#581c87">Conv1d</text>
+  <text x="712" y="141" text-anchor="middle" font-size="9" fill="#581c87">k=7</text>
+
+  <rect x="749" y="115" width="52" height="36" rx="5" fill="#f3e8ff" stroke="#9333ea"/>
+  <text x="775" y="126" text-anchor="middle" font-size="9" font-weight="bold" fill="#581c87">Conv1d</text>
+  <text x="775" y="137" text-anchor="middle" font-size="9" fill="#581c87">k=11</text>
+  <text x="775" y="148" text-anchor="middle" font-size="8" fill="#9333ea">dil=2</text>
+
+  <rect x="643" y="170" width="138" height="28" rx="5" fill="#ede9fe" stroke="#9333ea"/>
+  <text x="712" y="189" text-anchor="middle" font-size="10" fill="#581c87">concat → [B, 768, L]</text>
+
+  <rect x="658" y="214" width="108" height="28" rx="5" fill="#f3e8ff" stroke="#9333ea"/>
+  <text x="712" y="228" text-anchor="middle" font-size="9" font-weight="bold" fill="#581c87">Conv1d 768→256, k=1</text>
+  <text x="712" y="238" text-anchor="middle" font-size="8.5" fill="#581c87">GroupNorm · GELU</text>
+
+  <text transform="rotate(-90,611,194)" x="611" y="194" text-anchor="middle" font-size="8" fill="#6366f1" font-style="italic">residual (1×1 conv)</text>
+  <path d="M619,108 L619,280 L658,280" fill="none" stroke="#6366f1" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arrg)"/>
+
+  <rect x="658" y="268" width="108" height="28" rx="5" fill="#f3e8ff" stroke="#9333ea"/>
+  <text x="712" y="281" text-anchor="middle" font-size="9" font-weight="bold" fill="#581c87">Add + Dropout1d(0.15)</text>
+  <text x="712" y="292" text-anchor="middle" font-size="8.5" fill="#581c87">[B, 256, 1024]</text>
+
+  <!-- no pool label -->
+  <text x="712" y="330" text-anchor="middle" font-size="10" fill="#9333ea" font-style="italic">no pooling</text>
+
+  <line x1="649" y1="151" x2="649" y2="168" stroke="#9333ea" stroke-width="1.2" marker-end="url(#arrg)"/>
+  <line x1="712" y1="151" x2="712" y2="168" stroke="#9333ea" stroke-width="1.2" marker-end="url(#arrg)"/>
+  <line x1="775" y1="151" x2="775" y2="168" stroke="#9333ea" stroke-width="1.2" marker-end="url(#arrg)"/>
+  <line x1="712" y1="198" x2="712" y2="212" stroke="#9333ea" stroke-width="1.2" marker-end="url(#arrg)"/>
+  <line x1="712" y1="242" x2="712" y2="266" stroke="#9333ea" stroke-width="1.2" marker-end="url(#arrg)"/>
+
+  <text x="726" y="384" text-anchor="start" font-size="11" font-weight="bold" fill="#581c87">[B, 256, 1024]</text>
+
+  <!-- ===== BOTTOM ROW: AdaptivePool + TransformerStage + Pooling + Output ===== -->
+
+  <!-- AdaptiveAvgPool -->
+  <rect x="30" y="430" width="140" height="58" rx="8" fill="#fef9c3" stroke="#ca8a04" stroke-width="1.8"/>
+  <text x="100" y="454" text-anchor="middle" font-size="11" font-weight="bold" fill="#713f12">AdaptiveAvgPool1d</text>
+  <text x="100" y="470" text-anchor="middle" font-size="10" fill="#713f12">output size = 512</text>
+  <text x="100" y="484" text-anchor="middle" font-size="10" fill="#92400e">[B, 256, 512]</text>
+
+  <!-- TransformerStage box -->
+  <rect x="214" y="410" width="250" height="230" rx="10" fill="#fff7ed" stroke="#ea580c" stroke-width="2"/>
+  <text x="339" y="432" text-anchor="middle" font-size="12" font-weight="bold" fill="#7c2d12">TransformerStage</text>
+
+  <rect x="226" y="444" width="226" height="26" rx="5" fill="#fed7aa" stroke="#ea580c"/>
+  <text x="339" y="461" text-anchor="middle" font-size="10" fill="#7c2d12">SinusoidalPositionalEncoding1D</text>
+
+  <rect x="226" y="482" width="226" height="34" rx="5" fill="#fed7aa" stroke="#ea580c"/>
+  <text x="339" y="496" text-anchor="middle" font-size="10" font-weight="bold" fill="#7c2d12">MultiheadAttention</text>
+  <text x="339" y="510" text-anchor="middle" font-size="9.5" fill="#7c2d12">8 heads · d=256 · dropout=0.2</text>
+
+  <rect x="226" y="528" width="226" height="22" rx="5" fill="#ffedd5" stroke="#ea580c"/>
+  <text x="339" y="543" text-anchor="middle" font-size="10" fill="#7c2d12">LayerNorm · residual add</text>
+
+  <rect x="226" y="562" width="226" height="34" rx="5" fill="#fed7aa" stroke="#ea580c"/>
+  <text x="339" y="576" text-anchor="middle" font-size="10" font-weight="bold" fill="#7c2d12">FFN: 256 → 512 → 256</text>
+  <text x="339" y="590" text-anchor="middle" font-size="9.5" fill="#7c2d12">GELU · dropout=0.2</text>
+
+  <rect x="226" y="608" width="226" height="22" rx="5" fill="#ffedd5" stroke="#ea580c"/>
+  <text x="339" y="623" text-anchor="middle" font-size="10" fill="#7c2d12">LayerNorm · residual add</text>
+
+  <text x="339" y="654" text-anchor="middle" font-size="10" font-weight="bold" fill="#7c2d12">[B, 256, 512]</text>
+
+  <!-- internal arrows transformer -->
+  <line x1="339" y1="470" x2="339" y2="480" stroke="#ea580c" stroke-width="1.2" marker-end="url(#arr)"/>
+  <line x1="339" y1="516" x2="339" y2="526" stroke="#ea580c" stroke-width="1.2" marker-end="url(#arr)"/>
+  <line x1="339" y1="550" x2="339" y2="560" stroke="#ea580c" stroke-width="1.2" marker-end="url(#arr)"/>
+  <line x1="339" y1="596" x2="339" y2="606" stroke="#ea580c" stroke-width="1.2" marker-end="url(#arr)"/>
+
+  <!-- Global Pooling -->
+  <rect x="510" y="440" width="170" height="84" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.8"/>
+  <text x="595" y="462" text-anchor="middle" font-size="11" font-weight="bold" fill="#14532d">Global Pooling</text>
+  <rect x="522" y="473" width="68" height="22" rx="4" fill="#bbf7d0" stroke="#16a34a"/>
+  <text x="556" y="488" text-anchor="middle" font-size="9" fill="#14532d">AvgPool → 256</text>
+  <rect x="600" y="473" width="68" height="22" rx="4" fill="#bbf7d0" stroke="#16a34a"/>
+  <text x="634" y="488" text-anchor="middle" font-size="9" fill="#14532d">MaxPool → 256</text>
+  <text x="595" y="515" text-anchor="middle" font-size="10" fill="#14532d">concat → [B, 512]</text>
+
+  <!-- Output -->
+  <rect x="730" y="450" width="130" height="64" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.8"/>
+  <text x="795" y="475" text-anchor="middle" font-size="13" font-weight="bold" fill="#0f172a">Embedding</text>
+  <text x="795" y="495" text-anchor="middle" font-size="16" font-weight="bold" fill="#2563eb">ℝ⁵¹²</text>
+  <text x="795" y="510" text-anchor="middle" font-size="10" fill="#475569">[B, 512]</text>
+
+  <!-- ===== CONNECTION ARROWS - bottom row ===== -->
+
+  <!-- block3 output → AdaptivePool (diagonal) -->
+  <path d="M712,358 L712,400 L100,400 L100,428" fill="none" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <!-- AdaptivePool → TransformerStage -->
+  <line x1="170" y1="459" x2="212" y2="459" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <!-- TransformerStage → GlobalPooling -->
+  <line x1="464" y1="525" x2="508" y2="497" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <!-- GlobalPooling → Output -->
+  <line x1="680" y1="482" x2="728" y2="482" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <!-- dimension labels under bottom row -->
+  <text x="100" y="506" text-anchor="middle" font-size="9" fill="#92400e">[B, 256, 512]</text>
+
+  <!-- ===== LEGEND ===== -->
+  <rect x="30" y="680" width="940" height="118" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="50" y="700" font-size="11" font-weight="bold" fill="#1e293b">Notes</text>
+
+  <rect x="50" y="710" width="10" height="10" fill="#bfdbfe" stroke="#2563eb"/>
+  <text x="66" y="720" font-size="10" fill="#334155">SpectraBlock 1 kernels: k ∈ {3, 15, 31}; branches share in_ch, all output 64 ch; branch 3 uses dilation=2</text>
+
+  <rect x="50" y="726" width="10" height="10" fill="#bbf7d0" stroke="#059669"/>
+  <text x="66" y="736" font-size="10" fill="#334155">SpectraBlock 2 kernels: k ∈ {3, 11, 21}; branches share in_ch, all output 128 ch; branch 3 uses dilation=2</text>
+
+  <rect x="50" y="742" width="10" height="10" fill="#f3e8ff" stroke="#9333ea"/>
+  <text x="66" y="752" font-size="10" fill="#334155">SpectraBlock 3 kernels: k ∈ {3, 7, 11}; branches share in_ch, all output 256 ch; branch 3 uses dilation=2; no MaxPool</text>
+
+  <line x1="50" y1="762" x2="60" y2="762" stroke="#6366f1" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <text x="66" y="766" font-size="10" fill="#334155">Residual shortcut: 1×1 Conv1d when in_ch ≠ out_ch, else Identity. Added before GELU + Dropout1d.</text>
+
+  <text x="50" y="784" font-size="10" fill="#334155">All convolutions: padding="same" (PyTorch). GroupNorm(8 groups). ~4.4M encoder parameters total.</text>
+</svg>

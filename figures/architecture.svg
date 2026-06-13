@@ -37,7 +37,7 @@
   <text x="522" y="196" text-anchor="middle" font-size="13" fill="#1e3a8a">
     <tspan x="522" font-weight="bold" font-size="14">SpectraEncoder</tspan>
     <tspan x="522" dy="20">multi-scale 1-D CNN</tspan>
-    <tspan x="522" dy="18">+ transformer</tspan>
+    <tspan x="522" dy="18">+ attention heads</tspan>
     <tspan x="522" dy="18">→ 512-d embedding</tspan>
   </text>
 
