@@ -141,9 +141,15 @@ Both DESI and SDSS-V contribute positive and negative pairs, but at very differe
 
 A structural gap remains: DESI negatives are underrepresented relative to DESI positives. Acquiring more same-survey DESI negative pairs would be the highest-leverage data addition for future work.
 
-### SSL bias
+### SSL encoder bias
 
-Partly as a consequence of the above, the encoder trained on the full DR7 SSL pool is biased toward SDSS DR7 spectral characteristics. Objects observed only by DESI or SDSS-V may fall slightly out of distribution for the encoder. This is tracked but not yet resolved.
+The SSL pool is dominated by SDSS DR7 (~58% of spectra), so the encoder is better calibrated to DR7 spectral characteristics than to SDSS-V or DESI. The loss curve below makes this visible: the green line — validation loss computed on SDSS-V + DR16 spectra only — sits persistently higher than the global validation loss, meaning the encoder reconstructs non-DR7 surveys less accurately.
+
+<p align="center">
+  <img src="models/continuum_subtracted_full_dr7/ssl_loss_curve.png" alt="SSL pretraining loss — train, global val, and SDSS-V+DR16 val" width="650"/>
+</p>
+
+Checkpoint selection used the SDSS-V + DR16 validation loss (green) rather than the global loss as the selection criterion — this is a more honest signal for how the encoder will generalise to the surveys most relevant to the Siamese head. To directly address the DR7 dominance, an ablation capped the DR7 contribution to the SSL pool. Downstream Siamese performance was actually worse: the encoder benefits from the volume of DR7 data even at the cost of some survey bias, likely because the additional spectra improve the quality of the learned spectral representations overall. The bias is therefore acknowledged but accepted as a current limitation.
 
 ---
 
