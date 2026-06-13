@@ -256,7 +256,6 @@ def main():
         spectra_dir,
         cache_path=cache_path,
         oiii_snr_min=pp["oiii_snr_min"],
-        subtract_continuum=False,           # v2 representation
         split_filter="train"
     )
     n_pairs = len(arrays["y"])

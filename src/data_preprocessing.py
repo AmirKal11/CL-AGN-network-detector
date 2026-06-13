@@ -1,817 +1,490 @@
-import pandas as pd
-import numpy as np
-import astropy 
-from astropy.table import Table, hstack
-from astropy.io import fits
-import matplotlib.pyplot as plt
-import os
-from scipy.interpolate import interp1d
-from joblib import Parallel, delayed
-import glob
+"""
+data_preprocessing.py  (v2 — production)
+==========================================
+Orchestration layer: metadata CSV + flat FITS directory → Parquet.
+
+Expected layout
+---------------
+    <data_dir>/
+        spec-0276-51909-0006.fits
+        desi-spec-39633285443860992.fits
+        ...                              # all spectra, flat
+    metadata.csv                         # one row per spectrum
+
+Required CSV columns
+--------------------
+    spec_filename   basename of the FITS file
+    object_id       cross-epoch identifier (same value for both epochs of a pair)
+    survey          e.g. sdss_dr7 | dr16 | sdss_v | desi
+    agn_type        type1 | type2
+    z               redshift (preferred over FITS header; FITS used as fallback)
+
+Optional CSV columns (passed through to the parquet when present)
+-----------------------------------------------------------------
+    ra, dec         sky coordinates
+    snr             median SNR (if absent, extracted from FITS)
+    <any other>     added as metadata columns in the output parquet
+
+CLI
+---
+    python src/data_preprocessing.py \\
+        --data-dir  data/spectra/ \\
+        --csv       data/metadata.csv \\
+        --output    data/processed.parquet \\
+        [--min-snr 5.0] [--max-zeros-pct 0.8] \\
+        [--no-subtract-continuum] [--n-jobs -2]
+
+Low-level processing (sky removal, grid resampling, continuum subtraction) is
+delegated to the existing helpers defined below; only orchestration and
+path-handling live here.
+"""
+
+from __future__ import annotations
+
 import argparse
+import os
+import glob
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
-from astropy.cosmology import FlatLambdaCDM
-import astropy.units as u
+from astropy.io import fits
+from joblib import Parallel, delayed
+from scipy.interpolate import interp1d
 
-COSMO = FlatLambdaCDM(H0=70, Om0=0.3)
+
+# ---------------------------------------------------------------------------
+# Master wavelength grid (shared with preprocessing_oiii.MASTER_GRID)
+# ---------------------------------------------------------------------------
+GRID_MIN, GRID_MAX, GRID_N = 3000.0, 10400.0, 4096
+MASTER_GRID = np.linspace(GRID_MIN, GRID_MAX, GRID_N)
 
 
-# OIII functions and columns removed to support generic metadata.
+# ===========================================================================
+# Low-level helpers (unchanged from v1; kept here so the module is self-
+# contained when used as a library without the old import chain)
+# ===========================================================================
 
-def build_download_filename(row):
+def remove_sky_line(
+    wave_obs: np.ndarray,
+    flux_obs: np.ndarray,
+    line_center: float = 5577.3,
+    window: float = 20.0,
+    threshold: float = 4.0,
+) -> np.ndarray:
     """
-    Build the actual downloaded SDSS filename:
-        spec-PPPP-MMMMM-FFFF.fits
-
-    Handles both Type 1 and Type 2 CSV naming conventions.
+    Interpolate over the [O I] 5577 Å night-sky residual when it spikes
+    more than `threshold` × local σ above the surrounding continuum.
     """
+    mask_line = (wave_obs > line_center - window / 2) & (wave_obs < line_center + window / 2)
+    if not np.any(mask_line):
+        return flux_obs
 
-    plate = int(row.get("PLATE", 0))
+    mask_cont = (
+        ((wave_obs > line_center - window * 1.5) & (wave_obs <= line_center - window / 2))
+        | ((wave_obs >= line_center + window / 2) & (wave_obs < line_center + window * 1.5))
+    )
+    if not np.any(mask_cont):
+        return flux_obs
 
-    if "TARGETID" in row:
-        return f"desi-spec-{int(row['TARGETID'])}.fits"
+    local_med = np.nanmedian(flux_obs[mask_cont])
+    local_std = np.nanstd(flux_obs[mask_cont])
+    line_max = np.nanmax(flux_obs[mask_line])
 
-    if "mjd" in row:
-        mjd = int(row["mjd"])
-    elif "MJD" in row:
-        mjd = int(row["MJD"])
-    elif "MJD_class_table" in row:
-        mjd = int(row["MJD_class_table"])
-    else:
-        mjd = 0
+    if local_std > 0 and line_max > local_med + threshold * local_std:
+        x_cont = wave_obs[mask_cont]
+        y_cont = flux_obs[mask_cont]
+        if len(x_cont) > 1:
+            f = interp1d(x_cont, y_cont, kind="linear", bounds_error=False, fill_value="extrapolate")
+            flux_cleaned = flux_obs.copy()
+            flux_cleaned[mask_line] = f(wave_obs[mask_line])
+            return flux_cleaned
 
-    if "fiber" in row:
-        fiber = int(row["fiber"])
-    elif "FIBER" in row:
-        fiber = int(row["FIBER"])
-    elif "FIBERID_class_table" in row:
-        fiber = int(row["FIBERID_class_table"])
-    elif "FIBERID" in row:
-        fiber = int(row["FIBERID"])
-    else:
-        fiber = 0
-
-    if plate > 0:
-        return f"spec-{plate:04d}-{mjd:05d}-{fiber:04d}.fits"
-    return "unknown.fits"
+    return flux_obs
 
 
-def load_candidate_metadata(csv_path):
+def _get_redshift(hdul) -> float | None:
+    """Extract redshift from the SPECOBJ extension, or return None."""
+    try:
+        if "SPECOBJ" in hdul:
+            return float(hdul["SPECOBJ"].data["Z"][0])
+    except Exception:
+        pass
+    return None
+
+
+def _get_snr(hdul) -> float | None:
     """
-    Load candidate CSV and create a dictionary:
-        downloaded spectrum filename -> metadata dict
+    Extract median SNR from SPECOBJ.SN_MEDIAN_ALL, or compute it from
+    flux × sqrt(ivar) if the extension is absent.
     """
-    if csv_path is None or not os.path.exists(csv_path):
-        print(f"Warning: candidate metadata CSV not found: {csv_path}")
-        return {}
+    try:
+        if "SPECOBJ" in hdul:
+            data = hdul["SPECOBJ"].data
+            if "SN_MEDIAN_ALL" in data.names:
+                return float(data["SN_MEDIAN_ALL"][0])
+    except Exception:
+        pass
 
-    df = pd.read_csv(csv_path)
-    df["download_filename"] = df.apply(build_download_filename, axis=1)
-
-    # Only keep essential metadata to prevent bloat
-    keep_cols = ["TARGETID", "TARGET_RA", "TARGET_DEC", "RA", "DEC", "SDSS_NAME", "Z", "z"]
-
-    metadata = {}
-    for _, row in df.iterrows():
-        fname = row["download_filename"]
-        
-        row_meta = {}
-        for col in keep_cols:
-            if col in df.columns:
-                row_meta[col] = row[col]
-                
-        metadata[fname] = row_meta
-
-    print(f"Loaded metadata for {len(metadata)} spectra from {csv_path}")
-    return metadata
+    try:
+        data = hdul[1].data
+        names_lower = [n.lower() for n in data.names] if hasattr(data, "names") else []
+        if "flux" in names_lower:
+            flux = data["flux"]
+            if "ivar" in names_lower:
+                ivar = data["ivar"]
+                valid = (ivar > 0) & np.isfinite(flux) & np.isfinite(ivar)
+                if np.any(valid):
+                    return float(np.nanmedian(flux[valid] * np.sqrt(ivar[valid])))
+            valid = np.isfinite(flux)
+            if np.any(valid):
+                std_f = np.nanstd(flux[valid])
+                if std_f > 0:
+                    return float(np.nanmean(flux[valid]) / std_f)
+    except Exception:
+        pass
+    return None
 
 
 @torch.no_grad()
 def morphological_continuum_subtraction(
-    x,
-    window_size=173,
-    clip_max=4.0,
-    taper_len=5,
-    apply_mad_scaling=False,
-    valid_mask=None,
-    subtract_continuum=True,
-):
+    x: torch.Tensor,
+    window_size: int = 173,
+    taper_len: int = 5,
+    apply_mad_scaling: bool = False,
+    valid_mask: torch.Tensor | None = None,
+    subtract_continuum: bool = True,
+) -> torch.Tensor:
     """
-    Lightweight continuum removal using wide average pooling.
+    Wide moving-average continuum removal + optional MAD scaling + edge taper.
 
-    New behavior for OIII experiment:
-        - By default, this function does NOT apply independent MAD scaling.
-        - It only subtracts the smooth continuum and applies edge tapering.
-        - OIII columns are saved as metadata for later pair matching / calibration.
-
-    subtract_continuum=False keeps the full continuum (v2 default, set by
-    build_unified_ssl_parquet); True (the default here) preserves v1 behaviour.
-
-    x shape: [Batch, 1, Sequence_Length]
+    x shape: [B, 1, L]
     """
-
-    # 1. Pad the sequence to handle edge artifacts smoothly
     pad = window_size // 2
-
-    # The validity mask is needed below by MAD scaling and the zero-fill step
-    # whether or not the continuum is removed, so resolve it up front.
     vm = valid_mask.to(dtype=x.dtype) if valid_mask is not None else None
 
-    # 2-3. Estimate and subtract the smooth continuum. v1 anti-shortcut
-    #      representation; v2 sets subtract_continuum=False and keeps the full
-    #      continuum (the SSL encoder learns more from a full spectrum than
-    #      from a near-noise residual, and the cross-object classification
-    #      shortcut does not apply to SSL or same-object change detection).
-    #      When subtracting and a mask is supplied the continuum is a MASKED
-    #      moving average over covered pixels only, so the zero-filled
-    #      out-of-coverage region does not drag it toward zero near the edges.
     if subtract_continuum:
-        if valid_mask is not None:
+        if vm is not None:
             x_pad = F.pad(x * vm, (pad, pad), mode="reflect")
             v_pad = F.pad(vm, (pad, pad), mode="reflect")
             num = F.avg_pool1d(x_pad, kernel_size=window_size, stride=1)
             den = F.avg_pool1d(v_pad, kernel_size=window_size, stride=1)
             continuum = num / (den + 1e-8)
         else:
-            x_padded = F.pad(x, (pad, pad), mode="reflect")
-            continuum = F.avg_pool1d(x_padded, kernel_size=window_size, stride=1)
-        x_flattened = x - continuum
+            continuum = F.avg_pool1d(F.pad(x, (pad, pad), mode="reflect"), kernel_size=window_size, stride=1)
+        x_flat = x - continuum
     else:
-        x_flattened = x
+        x_flat = x
 
-    # 4. OLD MAD SCALING — disabled by default for OIII/difference-spectrum work.
-    # This was useful for single-spectrum Type1/Type2 classification, but it removes
-    # per-spectrum amplitude scale and can hurt same-object CL-AGN comparisons.
-    # When enabled, the median/MAD are taken over covered pixels only.
     if apply_mad_scaling:
-        if valid_mask is not None:
-            x_processed = torch.zeros_like(x_flattened)
-            for b in range(x_flattened.shape[0]):
+        x_proc = torch.zeros_like(x_flat)
+        for b in range(x_flat.shape[0]):
+            if vm is not None:
                 m = vm[b, 0] > 0.5
                 if int(m.sum()) < 2:
                     continue
-                vals = x_flattened[b, 0][m]
-                median = vals.median()
-                mad = (vals - median).abs().median()
-                x_processed[b, 0] = (x_flattened[b, 0] - median) / (mad * 1.4826 + 1e-8)
-        else:
-            median = x_flattened.median(dim=-1, keepdim=True).values
-            mad = (x_flattened - median).abs().median(dim=-1, keepdim=True).values
-            x_processed = (x_flattened - median) / (mad * 1.4826 + 1e-8)
+                vals = x_flat[b, 0][m]
+            else:
+                vals = x_flat[b, 0]
+            median = vals.median()
+            mad = (vals - median).abs().median()
+            x_proc[b, 0] = (x_flat[b, 0] - median) / (mad * 1.4826 + 1e-8)
     else:
-        x_processed = x_flattened
+        x_proc = x_flat
 
-    # 4b. Zero out non-covered pixels so they carry the 0.0 "missing" sentinel.
-    if valid_mask is not None:
-        x_processed = x_processed * vm
+    if vm is not None:
+        x_proc = x_proc * vm
 
-    # 5. Optional clipping — also disabled unless you explicitly turn it back on.
-    # x_processed = torch.clamp(x_processed, min=-10.0, max=clip_max)
-
-    # 6. Edge tapering
     seq_len = x.shape[-1]
     taper = torch.ones(seq_len, device=x.device)
-
-    fade = torch.linspace(0, 1, taper_len, device=x.device)
-    taper[:taper_len] = fade
-    taper[-taper_len:] = torch.flip(fade, dims=[0])
-
-    taper = taper.view(1, 1, -1)
-    x_final = x_processed * taper
-
-    return x_final
+    if taper_len > 0:
+        fade = torch.linspace(0.0, 1.0, taper_len, device=x.device)
+        taper[:taper_len] = fade
+        taper[-taper_len:] = torch.flip(fade, dims=[0])
+    return x_proc * taper.view(1, 1, -1)
 
 
-
-
-def standardize_flux(flux_array):
-    """Standardizes a flux array by mean and standard deviation."""
-    mean = np.nanmean(flux_array)
-    std = np.nanstd(flux_array)
-    # Adding a small epsilon to avoid division by zero
-    normalized_flux = (flux_array - mean) / (std + 1e-8)
-    return normalized_flux
-
-def get_redshift(hdul):
-    """Extracts redshift from the 'SPECOBJ' extension of the HDUList."""
-    try:
-        if 'SPECOBJ' in hdul:
-            data = hdul['SPECOBJ'].data
-            return data['Z'][0]
-        else:
-            return None
-    except Exception as e:
-        return None
-
-def get_snr(hdul):
-    """Extracts the median SNR from the 'SPECOBJ' extension."""
-    try:
-        if 'SPECOBJ' in hdul:
-            data = hdul['SPECOBJ'].data
-            if 'SN_MEDIAN_ALL' in data.names:
-                return data['SN_MEDIAN_ALL'][0] 
-    except Exception:
-        pass
-    
-    # Calculate manually if not in SPECOBJ
-    try:
-        data = hdul[1].data
-        names_lower = [n.lower() for n in data.names] if hasattr(data, 'names') else []
-        if 'flux' in names_lower:
-            flux = data['flux']
-            if 'ivar' in names_lower:
-                ivar = data['ivar']
-                valid = (ivar > 0) & np.isfinite(flux) & np.isfinite(ivar)
-                if np.any(valid):
-                    snr_arr = flux[valid] * np.sqrt(ivar[valid])
-                    return np.nanmedian(snr_arr)
-            valid = np.isfinite(flux)
-            if np.any(valid):
-                std_f = np.nanstd(flux[valid])
-                if std_f > 0:
-                    return np.nanmean(flux[valid]) / std_f
-    except Exception:
-        pass
-    return None
-
-def remove_sky_line(wave_obs, flux_obs, line_center=5577.3, window=20.0, threshold=4.0):
-    """
-    Removes sky line residuals (e.g., 5577 A [O I]) by checking for a sudden peak.
-    If a peak > threshold * local_std is found, it linearly interpolates over the region.
-    """
-    mask_line = (wave_obs > line_center - window/2) & (wave_obs < line_center + window/2)
-    if not np.any(mask_line):
-        return flux_obs
-        
-    mask_cont = ((wave_obs > line_center - window*1.5) & (wave_obs <= line_center - window/2)) | \
-                ((wave_obs >= line_center + window/2) & (wave_obs < line_center + window*1.5))
-                
-    if not np.any(mask_cont):
-        return flux_obs
-        
-    local_med = np.nanmedian(flux_obs[mask_cont])
-    local_std = np.nanstd(flux_obs[mask_cont])
-    line_max = np.nanmax(flux_obs[mask_line])
-    
-    if local_std > 0 and line_max > local_med + threshold * local_std:
-        x_cont = wave_obs[mask_cont]
-        y_cont = flux_obs[mask_cont]
-        if len(x_cont) > 1:
-            f = interp1d(x_cont, y_cont, kind='linear', bounds_error=False, fill_value='extrapolate')
-            flux_cleaned = flux_obs.copy()
-            flux_cleaned[mask_line] = f(wave_obs[mask_line])
-            return flux_cleaned
-            
-    return flux_obs
+# ===========================================================================
+# Per-spectrum processing
+# ===========================================================================
 
 def process_single_spectrum(
-    file_path,
-    agn_type,
-    master_grid,
-    file_metadata=None,
-    apply_mad_scaling=False,
-    continuum_window_size=173,
-    subtract_continuum=True,
-):
+    fits_path: str | Path,
+    z: float | None,
+    master_grid: np.ndarray = MASTER_GRID,
+) -> dict | None:
+    """
+    FITS → rest-frame grid → raw interpolated flux.
+
+    Returns the physical flux on the master grid with no normalisation.
+    Processing chain: sky-line removal → de-redshift → resample → zero-fill
+    out-of-coverage pixels. All normalisation (continuum subtraction, MAD,
+    OIII) is deferred to the dataset/training layer.
+
+    Parameters
+    ----------
+    fits_path   Path to the FITS file.
+    z           Redshift (from the metadata CSV). Falls back to the FITS
+                SPECOBJ header if None or NaN.
+    master_grid Rest-frame wavelength grid to interpolate onto.
+
+    Returns
+    -------
+    dict with keys: flux_array (np.ndarray[float32], shape [L]),
+                    valid_frac (float), snr (float | None), z (float)
+    None on any failure.
+    """
+    fits_path = str(fits_path)
     try:
-        with fits.open(file_path) as hdul:
-            z = None
-            if file_metadata:
-                z = file_metadata.get("Z", file_metadata.get("z", None))
-                
-            if z is None or pd.isna(z):
-                z = get_redshift(hdul)
-                
-            snr = get_snr(hdul)
-            
-            if z is None or pd.isna(z) or snr is None: return None
-            
-            # SDSS SPEC_ID or fallback to filename
-            obj_id = hdul[0].header.get('SPEC_ID', os.path.basename(file_path))
-            
-            # Extension 1 contains the 'COADD' spectrum in SDSS
+        with fits.open(fits_path) as hdul:
+            # --- redshift ---
+            if z is None or (isinstance(z, float) and np.isnan(z)):
+                z = _get_redshift(hdul)
+            if z is None:
+                return None
+
+            # --- SNR ---
+            snr = _get_snr(hdul)
+
+            # --- flux + wavelength ---
             data = hdul[1].data
-            flux_obs = data['flux']
-            
-            names_lower = [n.lower() for n in data.names] if hasattr(data, 'names') else []
-            
-            # Handle wavelengths: check for 'loglam' (common in SDSS) or 'wavelength'
-            if 'loglam' in names_lower:
-                wave_obs = 10**data['loglam']
-            elif 'wavelength' in names_lower:
-                wave_obs = data['wavelength']
+            flux_obs = np.asarray(data["flux"], dtype=np.float64)
+            names_lower = [n.lower() for n in data.names] if hasattr(data, "names") else []
+
+            if "loglam" in names_lower:
+                wave_obs = 10.0 ** np.asarray(data["loglam"], dtype=np.float64)
+            elif "wavelength" in names_lower:
+                wave_obs = np.asarray(data["wavelength"], dtype=np.float64)
             else:
-                header = hdul[1].header
-                wave_obs = header['CRVAL1'] + np.arange(len(flux_obs)) * header['CDELT1']
-            
-            # Remove prominent night sky line at 5577A if it spikes
-            flux_obs = remove_sky_line(wave_obs, flux_obs, line_center=5577.3)
-            
-            # 3. Rest-frame correction
-            wave_rest = wave_obs / (1 + z)
-            flux_rest = flux_obs * (1 + z)
+                hdr = hdul[1].header
+                wave_obs = hdr["CRVAL1"] + np.arange(len(flux_obs)) * hdr["CDELT1"]
 
-            # 4. Interpolate to the fixed grid; NaN outside the observed range.
+            # --- sky-line removal ---
+            flux_obs = remove_sky_line(wave_obs, flux_obs)
+
+            # --- rest-frame shift (flux-conserving) ---
+            wave_rest = wave_obs / (1.0 + z)
+            flux_rest = flux_obs * (1.0 + z)
+
+            # --- resample onto master grid ---
             f_interp = interp1d(wave_rest, flux_rest, bounds_error=False, fill_value=np.nan)
-            interpolated_flux = f_interp(master_grid)
+            grid_flux = f_interp(master_grid)
 
-            # 5. Validity mask + zero-fill (SpectraNet convention): pixels the
-            #    spectrograph never covered, once shifted to rest frame, are
-            #    flagged and set to 0.0 -- NOT median-filled, which would paint
-            #    a fake continuum the network could learn as a redshift cue.
-            valid = np.isfinite(interpolated_flux)
+            valid = np.isfinite(grid_flux)
             if int(valid.sum()) < 50:
                 return None
-            interpolated_flux = np.nan_to_num(interpolated_flux, nan=0.0)
 
-            # 6. Convert to PyTorch Tensors -> shape [1, 1, L]
-            tensor_flux = torch.tensor(interpolated_flux, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-            valid_tensor = torch.tensor(valid, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+            grid_flux = np.nan_to_num(grid_flux, nan=0.0)
 
-            # 7. Morphological continuum subtraction over covered pixels only.
-            #    Non-covered pixels stay exactly 0.0 in the output.
-            processed_tensor = morphological_continuum_subtraction(
-                tensor_flux,
-                window_size=continuum_window_size,
-                taper_len=5,
-                clip_max=4.0,
-                apply_mad_scaling=apply_mad_scaling,
-                valid_mask=valid_tensor,
-                subtract_continuum=subtract_continuum,
-            )
-            
-            # 8. Squeeze it back down to a flat 1D NumPy array for your Parquet file
-            processed_flux = processed_tensor.squeeze().numpy()
-            filename = os.path.basename(file_path)
+            # Raw physical flux; out-of-coverage pixels zeroed.
+            # No normalisation -- deferred to dataset/training layer.
+            flux_array = np.where(valid, grid_flux, 0.0).astype(np.float32)
 
-            result = {
-                "filename": filename,
-                "obj_id": obj_id,
-                "agn_type": agn_type,
-                "z": z,
-                "flux_array": processed_flux,
+            return {
+                "flux_array": flux_array,
+                "valid_frac": float(valid.mean()),
                 "snr": snr,
+                "z": float(z),
             }
 
-            # Attach catalogue metadata if available. The redshift key is
-            # SKIPPED here: result["z"] above is already the canonical
-            # redshift (taken from this same metadata or the FITS header).
-            # Copying the CSV's redshift back in would create a second,
-            # survey-dependent column -- DESI catalogs name it `Z`, SDSS
-            # catalogs name it `z` -- so the pooled parquet would carry both
-            # a `z` and a `Z`. Skipping any `z`/`Z` key guarantees exactly
-            # one redshift column, `z`, identical for both surveys.
-            if file_metadata:
-                for key, value in file_metadata.items():
-                    if str(key).lower() == "z":
-                        continue
-                    result[key] = value
-
-            return result
-            
-    except Exception as e:
-        print(f"Error loading {file_path}: {e}")
+    except Exception as exc:
+        print(f"[skip] {os.path.basename(fits_path)}: {exc}")
         return None
 
-def build_agn_catalog(
-    type1_path,
-    type2_path,
-    master_grid,
-    type1_metadata_csv=None,
-    type2_metadata_csv=None,
-    apply_mad_scaling=False,
-    continuum_window_size=173,
-    restrict_to_metadata=False,
-    subtract_continuum=True,
-):
-    """
-    restrict_to_metadata : bool
-        False (default) -- every *.fits file in type1_path/type2_path is
-        processed; the metadata CSV only attaches extra columns.
-        True -- the metadata CSV acts as a KEEP-LIST: a FITS file is processed
-        only if its basename appears in the CSV. This is how the DESI
-        SNR-uniform subset (desi_type1_type2_snr_uniform.csv) trims the ~204k
-        downloaded DESI spectra down to the redshift-balanced pool without
-        moving or deleting a single file.
-    """
-    type1_metadata = load_candidate_metadata(type1_metadata_csv)
-    type2_metadata = load_candidate_metadata(type2_metadata_csv)
 
-    files_type1 = [
-        (f, 1, type1_metadata.get(os.path.basename(f), {}))
-        for f in glob.glob(os.path.join(type1_path, "*.fits"))
-        if (not restrict_to_metadata) or os.path.basename(f) in type1_metadata
-    ]
-    files_type2 = [
-        (f, 2, type2_metadata.get(os.path.basename(f), {}))
-        for f in glob.glob(os.path.join(type2_path, "*.fits"))
-        if (not restrict_to_metadata) or os.path.basename(f) in type2_metadata
-    ]
+# ===========================================================================
+# Parquet builder
+# ===========================================================================
 
-    if restrict_to_metadata:
-        print(f"restrict_to_metadata=True: keep-list filter kept "
-              f"{len(files_type1)} type1 + {len(files_type2)} type2 "
-              f"FITS files out of all on disk")
+def _process_row(
+    fits_path: str,
+    row: dict,
+    master_grid: np.ndarray,
+) -> dict | None:
+    """Process one CSV row + its FITS file into a parquet-ready dict."""
+    z = row.get("z", None)
+    if z is not None:
+        try:
+            z = float(z)
+            if np.isnan(z):
+                z = None
+        except (ValueError, TypeError):
+            z = None
 
-    all_tasks = files_type1 + files_type2
-    print(f"Processing {len(all_tasks)} spectra...")
-    
-    results = Parallel(n_jobs=-2)(
-        delayed(process_single_spectrum)(
-            f_path,
-            a_type,
-            master_grid,
-            file_meta,
-            apply_mad_scaling,
-            continuum_window_size,
-            subtract_continuum,
-        )
-        for f_path, a_type, file_meta in all_tasks
+    result = process_single_spectrum(
+        fits_path,
+        z=z,
+        master_grid=master_grid,
     )
-    
-    # Filter out None results from failed loads
+    if result is None:
+        return None
+
+    out = {k: v for k, v in row.items() if k != "z"}  # row metadata (no duplicate z)
+    out["z"] = result["z"]                             # canonical redshift
+    out["valid_frac"] = result["valid_frac"]
+
+    # SNR: prefer CSV value if present; fall back to FITS-derived
+    if "snr" not in out or pd.isna(out.get("snr")):
+        out["snr"] = result["snr"]
+
+    out["flux_array"] = result["flux_array"]
+    return out
+
+
+def build_parquet(
+    data_dir: str | Path,
+    csv_path: str | Path,
+    output: str | Path,
+    master_grid: np.ndarray = MASTER_GRID,
+    min_snr: float = 4.0,
+    max_zeros_pct: float = 0.8,
+    n_jobs: int = -2,
+    recursive: bool = False,
+) -> pd.DataFrame:
+    """
+    Read `csv_path`, find each FITS in `data_dir`, process all spectra in
+    parallel, filter, and write a parquet to `output`.
+
+    The parquet schema
+    ------------------
+    Metadata columns first (all CSV columns + valid_frac + snr + z),
+    followed by 4096 float32 flux columns named by their rest-frame wavelength
+    (as strings, e.g. "3001.8").
+
+    Flux values are raw physical flux: sky-removed, de-redshifted, resampled
+    onto the master grid, out-of-coverage pixels zero-filled. No continuum
+    subtraction or normalisation is applied; that is deferred to the
+    dataset/training layer so that OIII can be measured on physical flux.
+
+    Parameters
+    ----------
+    data_dir        Directory (searched non-recursively) containing FITS files.
+    csv_path        Metadata CSV — one row per spectrum.
+    output          Destination parquet path (parent dirs created if needed).
+    min_snr         Drop spectra below this SNR.
+    max_zeros_pct   Drop spectra where more than this fraction of grid pixels
+                    are zero (i.e. outside the spectrograph coverage).
+    n_jobs          joblib parallelism (-1 = all cores, -2 = all but one).
+    recursive       If True, search data_dir recursively for FITS files
+                    (useful when FITS are organized in subdirectories).
+
+    Returns
+    -------
+    The cleaned DataFrame (also written to `output`).
+    """
+    data_dir = Path(data_dir)
+    csv_path = Path(csv_path)
+    output = Path(output)
+
+    # --- load metadata ---
+    meta = pd.read_csv(csv_path)
+    required = {"spec_filename", "object_id", "survey", "agn_type", "z"}
+    missing = required - set(meta.columns)
+    if missing:
+        raise ValueError(f"metadata CSV is missing required columns: {missing}")
+
+    # build filename → row lookup
+    rows = {row["spec_filename"]: row.to_dict() for _, row in meta.iterrows()}
+
+    # --- resolve FITS paths ---
+    pattern = "**/*.fits" if recursive else "*.fits"
+    fits_on_disk = {Path(f).name: str(f) for f in data_dir.glob(pattern)}
+    tasks = []
+    not_found = []
+    for fname, row in rows.items():
+        if fname in fits_on_disk:
+            tasks.append((fits_on_disk[fname], row))
+        else:
+            not_found.append(fname)
+
+    if not_found:
+        print(f"[warn] {len(not_found)} CSV entries have no matching FITS in {data_dir}")
+    print(f"Processing {len(tasks)} spectra (parallel, n_jobs={n_jobs})…")
+
+    # --- parallel processing ---
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_process_row)(fits_path, row, master_grid)
+        for fits_path, row in tasks
+    )
     results = [r for r in results if r is not None]
-            
-    # Assemble Metadata
-    all_result_keys = set()
-    for r in results:
-        all_result_keys.update(r.keys())
+    print(f"  succeeded: {len(results)} / {len(tasks)}")
 
-    meta_keys = [k for k in all_result_keys if k != 'flux_array']
+    if not results:
+        raise RuntimeError("No spectra processed successfully.")
 
-    meta_df = pd.DataFrame([
-        {key: r.get(key, np.nan) for key in meta_keys}
-        for r in results
-    ])
-    
-    # Assemble Fluxes (Matrix construction is faster than row-by-row append)
-    flux_matrix = np.array([r['flux_array'] for r in results])
-    flux_df = pd.DataFrame(flux_matrix, columns=master_grid)
-    # Merge horizontally
-    final_df = pd.concat([meta_df, flux_df], axis=1)
-    final_df.columns = final_df.columns.astype(str)
-    return final_df
-
-
-def clean_dataset(
-    df,
-    max_zeros_pct=0.8,
-    min_snr=5.0,
-    max_flux_outlier=None,
-    max_neg_flux=None,
-    require_valid_oiii=False,
-):
-    """
-    Cleans the dataset.
-
-    For the OIII/no-MAD experiment:
-        - OIII metadata columns are excluded from the flux matrix.
-        - max_flux_outlier and max_neg_flux are optional because the spectra
-          are no longer MAD-scaled.
-        - require_valid_oiii can be used to keep only spectra with good OIII flags.
-    """
-
-    # Dynamically identify flux columns vs metadata columns
-    # Flux columns are the wavelength grids (floats converted to strings)
-    flux_cols = [c for c in df.columns if str(c).replace('.', '', 1).isdigit()]
-    meta_cols = [c for c in df.columns if c not in flux_cols]
-
-    flux_mat = df[flux_cols].values.astype(float)
-
-    # 1. Filter bad coverage.
-    # On the wide 3000-10400 A grid a zero pixel means "out of the
-    # spectrograph's coverage" -- a high-redshift spectrum legitimately fills
-    # only part of the grid. max_zeros_pct=0.8 keeps anything covering >=20% of
-    # the grid (~1480 A), which still spans the Hbeta/[OIII] CL diagnostics;
-    # it must NOT be set near the old 0.5, which would discard every z>~0.4
-    # spectrum and defeat the point of the wide grid.
-    zeros_pct = (flux_mat == 0.0).mean(axis=1)
-    valid_coverage = zeros_pct <= max_zeros_pct
-
-    # 2. Optional positive outlier filtering.
-    # Disabled by default because non-MAD-scaled fluxes do not have the old scale.
-    if max_flux_outlier is not None:
-        max_flux = np.nanmax(flux_mat, axis=1)
-        valid_outlier = max_flux <= max_flux_outlier
-    else:
-        valid_outlier = np.ones(len(df), dtype=bool)
-
-    # 3. Filter low SNR
-    valid_snr = df["snr"] >= min_snr
-
-    # 4. Optional negative outlier filtering.
-    if max_neg_flux is not None:
-        min_flux = np.nanmin(flux_mat, axis=1)
-        valid_neg_flux = min_flux >= -max_neg_flux
-    else:
-        valid_neg_flux = np.ones(len(df), dtype=bool)
-
-    if require_valid_oiii:
-        print("Warning: require_valid_oiii=True is ignored because OIII checking is removed.")
-    valid_oiii = np.ones(len(df), dtype=bool)
-
-
-    # 6. Drop rows with all-NaN or non-finite flux values
-    valid_finite = np.isfinite(flux_mat).any(axis=1)
-
-    good_mask = (
-        valid_coverage
-        & valid_outlier
-        & valid_snr
-        & valid_neg_flux
-        & valid_oiii
-        & valid_finite
-    )
-
-    df_clean = df[good_mask].copy()
-
-    print(f"Original spectra: {len(df)}")
-    print(f"Dropped due to coverage:       {(~valid_coverage).sum()}")
-
-    if max_flux_outlier is not None:
-        print(f"Dropped due to pos outliers:   {(~valid_outlier).sum()}")
-    else:
-        print("Dropped due to pos outliers:   skipped")
-
-    print(f"Dropped due to low SNR:        {(~valid_snr).sum()}")
-
-    if max_neg_flux is not None:
-        print(f"Dropped due to neg flux:       {(~valid_neg_flux).sum()}")
-    else:
-        print("Dropped due to neg flux:       skipped")
-
-    if require_valid_oiii:
-        print(f"Dropped due to invalid OIII:   {(~valid_oiii).sum()}")
-
-    print(f"Dropped due to non-finite flux: {(~valid_finite).sum()}")
-    print(f"Remaining clean spectra:       {len(df_clean)}")
-
-    return df_clean
-    """
-    Cleans the dataset by removing spectra with low coverage, poor SNR,
-    extreme positive outliers, or extreme negative flux values.
-    
-    Parameters
-    ----------
-    max_neg_flux : float
-        After z-normalization, if any flux value in a spectrum is below
-        -max_neg_flux (i.e. has a negative dip larger than this threshold),
-        the entire spectrum is discarded.
-    """
-    meta_cols = ['filename', 'obj_id', 'agn_type', 'z', 'snr']
-    flux_cols = [c for c in df.columns if c not in meta_cols]
-    flux_mat = df[flux_cols].values
-    
-    # 1. Filter bad coverage
-    zeros_pct = (flux_mat == 0.0).mean(axis=1)
-    valid_coverage = zeros_pct <= max_zeros_pct
-    
-    # 2. Filter extreme positive outliers
-    max_flux = flux_mat.max(axis=1)
-    valid_outlier = max_flux <= max_flux_outlier
-    
-    # 3. Filter low SNR
-    valid_snr = df['snr'] >= min_snr
-    
-    # 4. Filter extreme negative flux after z-normalization
-    #    A spectrum is bad if min(flux) < -max_neg_flux
-    min_flux = flux_mat.min(axis=1)
-    valid_neg_flux = min_flux >= -max_neg_flux
-    
-    # Combine masks
-    good_mask = valid_coverage & valid_outlier & valid_snr & valid_neg_flux
-    df_clean = df[good_mask].copy()
-    
-    print(f"Original spectra: {len(df)}")
-    print(f"Dropped due to coverage:       {(~valid_coverage).sum()}")
-    print(f"Dropped due to pos outliers:   {(~valid_outlier).sum()}")
-    print(f"Dropped due to low SNR:        {(~valid_snr).sum()}")
-    print(f"Dropped due to neg flux (<-{max_neg_flux}): {(~valid_neg_flux).sum()}")
-    print(f"Remaining clean spectra:       {len(df_clean)}")
-    
-    return df_clean
-
-def run_preprocessing(
-    mode="full",
-    existing_parquet="data/O3_normalized_network/processed_agn_catalog_cut.parquet",
-    output="data/O3_normalized_network/processed_agn_OIII_ready.parquet",
-    type1_metadata_csv="data/O3_normalized_network/type1_candidates.csv",
-    type2_metadata_csv="data/O3_normalized_network/type2_candidates.csv",
-    type1_path="data/O3_normalized_network/Type1/",
-    type2_path="data/O3_normalized_network/Type2/",
-    apply_mad_scaling=False,
-    require_valid_oiii=False,
-    continuum_window_size=173,
-):
-    """
-    Main preprocessing pipeline.
-    
-    Parameters
-    ----------
-    mode : str
-        'full'     - process original type1/ and type2/ directories.
-        'new_only' - process type1_new/ and type2_new/ only.
-        'merge'    - process new dirs and merge with existing parquet.
-    existing_parquet : str
-        Path to existing parquet file (used only in 'merge' mode).
-    output : str
-        Path to save the cleaned output parquet.
-    """
-    # Wide rest-frame grid (see preprocessing_oiii.MASTER_GRID): 3000-10400 A,
-    # 4096 px. Spectra cover only a redshift-dependent sub-range of it; the rest
-    # is zero-filled and flagged. This is what lets every redshift be used.
-    master_grid = np.linspace(3000, 10400, 4096)
-    
-    if mode == 'full':
-        print("=== Processing original type1/type2 directories ===")
-        df = build_agn_catalog(
-            type1_path=type1_path,
-            type2_path=type2_path,
-            master_grid=master_grid,
-            type1_metadata_csv=type1_metadata_csv,
-            type2_metadata_csv=type2_metadata_csv,
-            apply_mad_scaling=apply_mad_scaling,
-            continuum_window_size=continuum_window_size,
-        )
-    elif mode == 'new_only':
-        print("=== Processing NEW type1_new/type2_new directories ===")
-        df = build_agn_catalog(
-            type1_path=type1_path,
-            type2_path=type2_path,
-            master_grid=master_grid,
-            type1_metadata_csv=type1_metadata_csv,
-            type2_metadata_csv=type2_metadata_csv,
-            apply_mad_scaling=apply_mad_scaling,
-            continuum_window_size=continuum_window_size,
-        )
-    elif mode == 'merge':
-        print("=== Processing NEW data and merging with existing parquet ===")
-        df_new = build_agn_catalog(
-            type1_path=type1_path,
-            type2_path=type2_path,
-            master_grid=master_grid,
-            type1_metadata_csv=type1_metadata_csv,
-            type2_metadata_csv=type2_metadata_csv,
-            apply_mad_scaling=apply_mad_scaling,
-            continuum_window_size=continuum_window_size,
-        )
-        print(f"\nNew spectra processed: {len(df_new)}")
-        
-        print(f"Loading existing parquet: {existing_parquet}")
-        df_existing = pd.read_parquet(existing_parquet)
-        print(f"Existing spectra: {len(df_existing)}")
-        
-        # Merge: drop duplicates based on filename to avoid re-adding existing spectra
-        df = pd.concat([df_existing, df_new], ignore_index=True)
-        df = df.drop_duplicates(subset='filename', keep='first')
-        print(f"Combined (deduplicated): {len(df)}")
-    else:
-        raise ValueError(f"Unknown mode '{mode}'. Choose from: 'full', 'new_only', 'merge'.")
-    
-    print("\nCleaning dataset...")
-    df_clean = clean_dataset(
-    df,
-        max_zeros_pct=0.8,
-        min_snr=5.0,
-        max_flux_outlier=None,
-        max_neg_flux=None,
-        require_valid_oiii=require_valid_oiii,
-    )
-
-    df_clean.to_parquet(output)
-    print(f'\nSaved cleaned df with {len(df_clean)} spectra to {output}')
-    return df_clean
-
-
-def build_unified_ssl_parquet(
-    dr7_type1_path="data/full_data/type1/",
-    dr7_type2_path="data/full_data/type2/",
-    dr7_type1_metadata_csv="data/full_data/type1_candidates.csv",
-    dr7_type2_metadata_csv="data/full_data/type2_candidates.csv",
-    desi_type1_path="data/full_data/desi_spectra/type1/",
-    desi_type2_path="data/full_data/desi_spectra/type2/",
-    desi_metadata_csv="data/full_data/desi_type1_type2_snr_uniform.csv",
-    output="data/ssl_unified_dr7_desi.parquet",
-    apply_mad_scaling=True,
-    subtract_continuum=False,
-    continuum_window_size=173,
-    max_zeros_pct=0.8,
-    min_snr=8.0,
-):
-    """
-    Build ONE unified self-supervised parquet pooling SDSS-DR7 + DESI spectra.
-
-    Stage-1 SSL pretraining (pretrain_ssl.py) learns from unlabelled spectra
-    pooled across surveys. This builds that pool into a single parquet, so
-    SSLSpectraDataset reads one file instead of one parquet per survey.
-
-    Both surveys are processed onto the identical wide master grid
-    (3000-10400 A, 4096 px), so their 4096 flux columns align exactly; a
-    `survey` column ('sdss_dr7' / 'desi') tags every row. Each survey is built
-    and cleaned separately -- so the coverage / SNR drop report is per-survey
-    -- and the two cleaned frames are then concatenated.
-
-    subtract_continuum=False (v2 default): the full continuum is kept; rows are
-    MAD-scaled full spectra (over covered pixels only), i.e. channel 0 directly
-    for SSLSpectraDataset. apply_mad_scaling=True applies that MAD scaling.
-    min_snr is the spectrum-quality cut; raised from the old 5.0 so the SSL
-    pool is cleaner -- tune it from the per-survey cleaning report.
-    """
-    master_grid = np.linspace(3000, 10400, 4096)
-
-    def _one_survey(name, t1_path, t2_path, t1_csv, t2_csv, restrict=False):
-        print(f"\n{'=' * 60}\n=== {name}: building catalog ===\n{'=' * 60}")
-        df = build_agn_catalog(
-            type1_path=t1_path,
-            type2_path=t2_path,
-            master_grid=master_grid,
-            type1_metadata_csv=t1_csv,
-            type2_metadata_csv=t2_csv,
-            apply_mad_scaling=apply_mad_scaling,
-            continuum_window_size=continuum_window_size,
-            restrict_to_metadata=restrict,
-            subtract_continuum=subtract_continuum,
-        )
-        print(f"\n{name}: {len(df)} spectra processed; cleaning...")
-        df = clean_dataset(
-            df,
-            max_zeros_pct=max_zeros_pct,
-            min_snr=min_snr,
-            max_flux_outlier=None,
-            max_neg_flux=None,
-            require_valid_oiii=False,
-        )
-        df["survey"] = name
-        return df
-
-    # DR7: every FITS file in the dirs is wanted -> no keep-list filter.
-    # DESI: the dirs hold ~204k spectra but only the SNR-uniform subset
-    # (desi_type1_type2_snr_uniform.csv) should enter the pool -> restrict.
-    df_dr7 = _one_survey("sdss_dr7", dr7_type1_path, dr7_type2_path,
-                         dr7_type1_metadata_csv, dr7_type2_metadata_csv)
-    df_desi = _one_survey("desi", desi_type1_path, desi_type2_path,
-                          desi_metadata_csv, desi_metadata_csv, restrict=True)
-
-    # ---- reconcile to ONE identical schema across surveys -------------
-    # Both frames share the 4096 flux columns (identical master grid), the
-    # core columns filename/obj_id/agn_type/z/snr/survey, and RA/DEC. DESI
-    # RA/DEC come from desi_type1_type2_snr_uniform.csv, which renames the
-    # catalog's TARGET_RA/TARGET_DEC to RA/DEC so they line up with the SDSS
-    # columns. The only columns that still differ are survey-private
-    # identifiers -- TARGETID (DESI) and SDSS_NAME (DR7) -- and those are
-    # dropped, so the pooled parquet has a single consistent column set with
-    # exactly ONE redshift column `z` valid for both surveys. Per-object
-    # identity is still preserved by `filename` (desi-spec-<TARGETID>.fits /
-    # spec-<plate>-<mjd>-<fiber>.fits).
-    common = [c for c in df_dr7.columns if c in set(df_desi.columns)]
-    drop_dr7 = [c for c in df_dr7.columns if c not in common]
-    drop_desi = [c for c in df_desi.columns if c not in common]
-    if drop_dr7 or drop_desi:
-        print("\nUnifying schema -- dropping survey-specific columns:")
-        print(f"  DR7  only : {drop_dr7}")
-        print(f"  DESI only : {drop_desi}")
-    df_dr7 = df_dr7[common]
-    df_desi = df_desi[common]
-
-    # Pool the surveys. Columns are now identical in name and order, so the
-    # concat is a clean vertical stack with no NaN-padded columns.
-    df = pd.concat([df_dr7, df_desi], ignore_index=True)
+    # --- assemble DataFrame ---
+    flux_matrix = np.stack([r.pop("flux_array") for r in results])  # [N, 4096]
+    meta_df = pd.DataFrame(results)
+    flux_df = pd.DataFrame(flux_matrix, columns=master_grid.astype(str))
+    df = pd.concat([meta_df.reset_index(drop=True), flux_df], axis=1)
     df.columns = df.columns.astype(str)
 
-    # Schema sanity check: no column should be entirely NaN (that would mean a
-    # column slipped through that only one survey populates).
-    all_nan = [c for c in df.columns if df[c].isna().all()]
-    if all_nan:
-        print(f"WARNING: {len(all_nan)} all-NaN column(s) after pooling: "
-              f"{all_nan[:8]}")
+    # --- quality filtering ---
+    n_before = len(df)
 
-    print(f"\n{'=' * 60}")
-    print(f"Unified SSL pool: {len(df)} spectra")
-    print(f"  by survey : {df['survey'].value_counts().to_dict()}")
-    print(f"{'=' * 60}")
+    if "snr" in df.columns:
+        snr_vals = pd.to_numeric(df["snr"], errors="coerce")
+        mask_snr = snr_vals >= min_snr
+    else:
+        mask_snr = pd.Series(True, index=df.index)
 
-    df.to_parquet(output)
-    print(f"Saved unified SSL parquet -> {output}")
+    zero_frac = (flux_matrix == 0.0).mean(axis=1)
+    mask_cov = zero_frac <= max_zeros_pct
+
+    mask_finite = np.isfinite(flux_matrix).any(axis=1)
+
+    df = df[mask_snr & mask_cov & mask_finite].copy()
+
+    print(
+        f"Quality filter: kept {len(df)} / {n_before}  "
+        f"(dropped {(~mask_snr).sum()} low-SNR, "
+        f"{(~mask_cov).sum()} low-coverage, "
+        f"{(~mask_finite).sum()} non-finite)"
+    )
+
+    # --- write ---
+    output.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(output, index=False)
+    print(f"Saved → {output}  ({len(df)} spectra, {len(df.columns)} columns)")
     return df
 
 
-# --- EXECUTION ---
+# ===========================================================================
+# CLI
+# ===========================================================================
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Build a spectral parquet from a flat FITS directory + metadata CSV.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--data-dir", required=True,
+                   help="Directory containing FITS files (flat).")
+    p.add_argument("--csv", required=True,
+                   help="Metadata CSV (one row per spectrum).")
+    p.add_argument("--output", required=True,
+                   help="Output parquet path.")
+    p.add_argument("--min-snr", type=float, default=5.0,
+                   help="Minimum median SNR to keep a spectrum.")
+    p.add_argument("--max-zeros-pct", type=float, default=0.8,
+                   help="Maximum fraction of zero-filled grid pixels (coverage filter).")
+    p.add_argument("--recursive", action="store_true",
+                   help="Search data-dir recursively for FITS (use when FITS are in subdirs).")
+    p.add_argument("--n-jobs", type=int, default=-2,
+                   help="joblib parallelism (-1 all cores, -2 all but one).")
+    return p.parse_args()
+
+
 if __name__ == "__main__":
-    # Build the unified Stage-1 (SSL) pretraining pool: SDSS-DR7 + DESI in ONE
-    # parquet, on the wide 3000-10400 A / 4096-px grid. Point config_v2.yml
-    # paths.ssl_parquets at the output below.
-    build_unified_ssl_parquet(
-        dr7_type1_path="data/full_data/type1/",
-        dr7_type2_path="data/full_data/type2/",
-        dr7_type1_metadata_csv="data/full_data/type1_candidates.csv",
-        dr7_type2_metadata_csv="data/full_data/type2_candidates.csv",
-        desi_type1_path="data/full_data/desi_spectra/type1/",
-        desi_type2_path="data/full_data/desi_spectra/type2/",
-        desi_metadata_csv="data/full_data/desi_type1_type2_snr_uniform.csv",
-        output="data/ssl_unified_dr7_desi.parquet",
-        apply_mad_scaling=True,
-        subtract_continuum=False,   # v2: keep the full continuum
-        min_snr=8.0,                # spectrum-quality cut (was 5.0); tune from
-                                    # the per-survey cleaning report
+    args = _parse_args()
+    build_parquet(
+        data_dir=args.data_dir,
+        csv_path=args.csv,
+        output=args.output,
+        min_snr=args.min_snr,
+        max_zeros_pct=args.max_zeros_pct,
+        recursive=args.recursive,
+        n_jobs=args.n_jobs,
     )

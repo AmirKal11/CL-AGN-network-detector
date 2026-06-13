@@ -49,20 +49,28 @@ from architectures_v2 import MaskedSpectraAutoencoder, apply_span_mask
 from preprocessing_oiii import save_norm_stats
 
 
-def masked_mse(recon, target, span_mask, valid=None):
+def masked_mse(recon, target, span_mask, valid=None, survey_weights=None):
     """Reconstruction MSE over span-masked AND covered positions.
 
     recon/target [B,C,L]; span_mask/valid [B,L] bool. Restricting to covered
     pixels stops the model from being rewarded for predicting the 0.0
     out-of-coverage sentinel, which would otherwise dominate the loss for
     high-redshift spectra (a large fraction of the wide grid is uncovered).
+
+    survey_weights: optional [B] float tensor — per-sample loss multipliers.
     """
     m = span_mask
     if valid is not None:
         m = m & valid
     m = m.unsqueeze(1).float()                         # [B,1,L]
-    se = (recon - target) ** 2 * m
-    return se.sum() / (m.sum() * recon.shape[1] + 1e-8)
+    se = (recon - target) ** 2 * m                     # [B,C,L]
+    if survey_weights is not None:
+        w = survey_weights.view(-1, 1, 1)              # [B,1,1]
+        se = se * w
+        norm = (m * w.squeeze(2).unsqueeze(1)).sum() * recon.shape[1] + 1e-8
+    else:
+        norm = m.sum() * recon.shape[1] + 1e-8
+    return se.sum() / norm
 
 
 def pick_device():
@@ -85,7 +93,7 @@ def plot_input_sample(dataset, out_dir):
     """
     idx = int(np.random.default_rng().integers(len(dataset)))
     raw = np.asarray(dataset.flux[idx], dtype=np.float32)   # channel 0, pre-arcsinh
-    x, valid = dataset[idx]                                 # x [2,L], arcsinh-compressed
+    x, valid, _ = dataset[idx]                              # x [2,L], arcsinh-compressed
     x = x.numpy()
     valid = valid.numpy().astype(bool)
     wave = dataset.wave
@@ -323,7 +331,8 @@ def main():
         model.eval()
         vrun, vnb = 0.0, 0
         with torch.no_grad():
-            for x, valid in loader:
+            for batch in loader:
+                x, valid = batch[0], batch[1]   # ignore survey weights for val
                 x = x.to(device); valid = valid.to(device)
                 x_masked, span = apply_span_mask(x, valid, s["mask_ratio"],
                                                  s["min_span"], s["max_span"])
@@ -336,13 +345,14 @@ def main():
         t0 = time.time()
         model.train()
         running, nb = 0.0, 0
-        for x, valid in train_loader:
+        for x, valid, sw in train_loader:
             x = x.to(device)
             valid = valid.to(device)
+            sw = sw.to(device)
             x_masked, span = apply_span_mask(x, valid, s["mask_ratio"],
                                              s["min_span"], s["max_span"])
             recon = model(x_masked)
-            loss = masked_mse(recon, x, span, valid)
+            loss = masked_mse(recon, x, span, valid, survey_weights=sw)
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)

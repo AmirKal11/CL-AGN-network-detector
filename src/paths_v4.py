@@ -12,7 +12,7 @@ same two-root search.
 """
 import os
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = '/Users/amir/Documents/Deep learning/cl-agn classifier -Legacy version'
 DATA_RAW = os.path.join(BASE_DIR, "data")        # inputs + existing spectra
 DATA_OUT = os.path.join(BASE_DIR, "data_v4")     # built outputs + new spectra
 os.makedirs(DATA_OUT, exist_ok=True)

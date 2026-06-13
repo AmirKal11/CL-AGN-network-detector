@@ -111,7 +111,21 @@ def _pr_curve(probs: np.ndarray, labels: np.ndarray):
 
 def _resolve_path(spectra_dir: str, name) -> str:
     p = str(name)
-    return p if os.path.isabs(p) else os.path.join(spectra_dir, p)
+    if os.path.isabs(p):
+        return p
+    cand = os.path.join(spectra_dir, p)
+    if os.path.exists(cand):
+        return cand
+    # Also search sibling directories (e.g. data/ when spectra_dir is data_v4/)
+    parent = os.path.dirname(os.path.abspath(spectra_dir))
+    try:
+        for d in os.listdir(parent):
+            c = os.path.join(parent, d, p)
+            if os.path.exists(c):
+                return c
+    except OSError:
+        pass
+    return cand
 
 
 def _pick_examples(probs, labels, saved_threshold, df_aligned):
@@ -278,7 +292,6 @@ def main():
         spectra_dir,
         cache_path=eval_cache,
         oiii_snr_min=pp["oiii_snr_min"],
-        subtract_continuum=False,
         split_filter="test"
     )
     n = len(arrays["y"])
@@ -466,10 +479,7 @@ def main():
         ax.plot(pr_r, pr_p, color="#1f4e79", lw=2)
         ax.scatter([saved["recall"]], [saved["precision"]],
                    color="#c0392b", s=70, zorder=5,
-                   label=f"saved thr={saved_threshold:.2f}")
-        ax.scatter([chosen["recall"]], [chosen["precision"]],
-                   color="#27ae60", s=70, marker="s", zorder=5,
-                   label=f"tuned-on-test thr={chosen['threshold']:.2f}")
+                   label=f"thr={saved_threshold:.2f}")
     ax.set_xlabel("recall"); ax.set_ylabel("precision")
     ax.set_xlim(0, 1.0); ax.set_ylim(0, 1.05)
     ax.set_title(f"PR curve  (AP={ap:.3f})")

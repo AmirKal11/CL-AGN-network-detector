@@ -85,23 +85,19 @@ def read_fits_flux_wave(path):
     return wave[order], flux[order]
 
 
-def fits_to_flat(path, z, subtract_continuum=False):
+def fits_to_flat(path, z):
     """
-    FITS file -> rest-frame flux on MASTER_GRID, plus the per-pixel validity
-    mask.
+    FITS file -> raw rest-frame flux on MASTER_GRID, plus the per-pixel
+    validity mask.
 
-    Same preprocessing chain as data_preprocessing.process_single_spectrum:
-    sky-line removal -> rest-frame correction -> interpolation to the master
-    grid -> validity mask + zero-fill. With subtract_continuum=True the smooth
-    continuum is then removed over covered pixels only; v2 leaves it
-    subtract_continuum=False so the result matches the full-spectrum SSL
-    parquet (data_preprocessing.build_unified_ssl_parquet also has it False).
-    No MAD here -- MAD is applied separately so the [OIII] channel can be
-    derived consistently.
+    Processing chain: sky-line removal -> rest-frame correction ->
+    interpolation to the master grid -> zero-fill out-of-coverage pixels.
+    No continuum subtraction or normalisation -- those are deferred so that
+    OIII can be measured on the physical flux before MAD normalisation.
 
     Returns
     -------
-    flat  : np.ndarray float32 [L]  flux on the grid, 0.0 where invalid
+    flat  : np.ndarray float32 [L]  raw flux on the grid, 0.0 where invalid
     valid : np.ndarray bool    [L]  True where the spectrum has real coverage
     """
     from scipy.interpolate import interp1d
@@ -119,34 +115,30 @@ def fits_to_flat(path, z, subtract_continuum=False):
     valid = np.isfinite(interp)
     if int(valid.sum()) < 50:
         raise ValueError(f"insufficient wavelength overlap on master grid: {path}")
-    interp = np.nan_to_num(interp, nan=0.0)
 
-    if subtract_continuum:
-        flat = continuum_subtract(interp, valid=valid,
-                                  window_size=CONTINUUM_WINDOW)
-    else:
-        # v2: keep the full continuum so the pair path matches the SSL
-        # parquet representation. MAD normalisation happens later.
-        flat = np.where(valid, interp, 0.0)
+    flat = np.where(valid, interp, 0.0)
     return flat.astype(np.float32), valid.astype(bool)
 
 
-def _two_channel(madnorm, oiii_flux, oiii_reliable, channel1_scale):
+def _two_channel(raw_flux, madnorm, oiii_flux, oiii_reliable, channel1_scale):
     """
-    Assemble a [2, L] tensor-ready array from a MAD-normalised spectrum.
+    Assemble a [2, L] tensor-ready array.
 
-    Both channels are arcsinh-compressed. MAD-normalised spectra have a very
-    heavy dynamic range -- noise is O(1) but line peaks reach tens to hundreds,
-    and the [OIII]-divided channel 1 can be larger still for weak-[OIII]
-    objects. Left raw, that tail makes the reconstruction loss explode and the
-    training oscillate. arcsinh is linear near zero (noise is barely touched)
-    and logarithmic for large values (peaks are compressed), and it is
-    monotonic + sign-preserving, so relative line amplitudes -- the CL-AGN
-    signal -- are preserved.
+    ch0 = MAD-normalised flux (robust shape encoding)
+    ch1 = [OIII]-normalised raw flux (cross-epoch amplitude anchor)
+
+    OIII flux must be measured on the raw physical spectrum (before MAD
+    normalisation) so the amplitude anchor retains its physical meaning.
+    Dividing raw_flux by oiii_flux puts both epochs on a common scale;
+    channel1_scale normalises so the typical ch1 magnitude matches ch0.
+
+    Both channels are arcsinh-compressed to tame the heavy dynamic-range tail
+    (line peaks, and the OIII-divided channel for weak-OIII objects) while
+    preserving sign and relative line amplitudes -- the CL-AGN signal.
     """
     ch0 = madnorm
     if oiii_reliable:
-        ch1 = (madnorm / oiii_flux) / channel1_scale
+        ch1 = raw_flux / (oiii_flux * channel1_scale)
     else:
         ch1 = madnorm  # graceful fallback -> channel 1 == channel 0
     x = np.stack([ch0, ch1], axis=0)
@@ -160,10 +152,11 @@ class SSLSpectraDataset(Dataset):
     """
     Unlabelled spectra pooled from processed parquet catalogs.
 
-    Each parquet is expected to be MAD-scaled full spectra on the wide master
-    grid (i.e. the output of data_preprocessing.build_unified_ssl_parquet,
-    which sets subtract_continuum=False, apply_mad_scaling=True) -- so a
-    parquet row is channel 0 directly.
+    Each parquet is expected to contain raw physical flux on the wide master
+    grid (the output of data_preprocessing.build_parquet): sky-removed,
+    de-redshifted, resampled, out-of-coverage pixels zero-filled. No
+    normalisation in the parquet -- continuum subtraction and MAD normalisation
+    happen in __getitem__; OIII is pre-computed in __init__ on raw flux.
     Out-of-coverage pixels are exactly 0.0; the per-pixel validity mask is
     recovered from that sentinel via preprocessing_oiii.valid_from_flux.
 
@@ -254,19 +247,32 @@ class SSLSpectraDataset(Dataset):
     def __len__(self):
         return len(self.flux)
 
+    # Survey loss weights: upweight deployment surveys (sdssv, dr16) relative to
+    # the large DR7/DESI pretraining pool to reduce the domain gap.
+    SURVEY_LOSS_WEIGHTS: dict[str, float] = {
+        "sdssv":    3.0,
+        "dr16":     3.0,
+        "sdss_dr7": 1.0,
+        "desi":     1.0,
+    }
+
     def __getitem__(self, i):
-        row = self.flux[i]
-        valid = valid_from_flux(row)
-        x = _two_channel(row, self.oiii_flux[i],
+        raw = self.flux[i]                           # raw physical flux from parquet
+        valid = valid_from_flux(raw)
+        cs = continuum_subtract(raw, valid=valid)    # continuum-subtracted (shape)
+        madnorm, _ = mad_normalize(cs, valid=valid)  # MAD-normalised (ch0)
+        x = _two_channel(raw, madnorm, self.oiii_flux[i],
                          bool(self.oiii_reliable[i]), self.channel1_scale)
-        return torch.from_numpy(x), torch.from_numpy(valid)
+        survey = str(self.meta.iloc[i].get("survey", "")) if hasattr(self.meta.iloc[i], "get") else str(self.meta["survey"].iloc[i])
+        w = self.SURVEY_LOSS_WEIGHTS.get(survey, 1.0)
+        return torch.from_numpy(x), torch.from_numpy(valid), torch.tensor(w, dtype=torch.float32)
 
 
 # ----------------------------------------------------------------------
 # Stage 2: real same-object pair preprocessing + dataset
 # ----------------------------------------------------------------------
 # v4: spectra are split across data_v4/ (new) and data/ (existing). Resolve by
-# searching the given dir, then both roots, so pair_spectra_dir need not be exact.
+# searching the given dir, then sibling dirs of spectra_dir, then project roots.
 _V4_ROOTS = [os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), d)
              for d in ("data_v4", "data")]
 
@@ -278,6 +284,18 @@ def _resolve(spectra_dir, name):
     cand = os.path.join(spectra_dir, p)
     if os.path.exists(cand):
         return cand
+    # Check sibling directories of spectra_dir (e.g. data/ when spectra_dir is data_v4/)
+    parent = os.path.dirname(os.path.abspath(spectra_dir))
+    try:
+        siblings = [os.path.join(parent, d) for d in os.listdir(parent)
+                    if os.path.isdir(os.path.join(parent, d))]
+    except OSError:
+        siblings = []
+    for sib in siblings:
+        c = os.path.join(sib, p)
+        if os.path.exists(c):
+            return c
+    # Project-relative fallback
     for r in _V4_ROOTS:
         c = os.path.join(r, p)
         if os.path.exists(c):
@@ -286,29 +304,36 @@ def _resolve(spectra_dir, name):
 
 
 def load_or_build_pair_arrays(pkl_path, spectra_dir, cache_path=None,
-                              oiii_snr_min=4.0, subtract_continuum=False,
-                              verbose=True, split_filter=None):
+                              oiii_snr_min=4.0, verbose=True,
+                              split_filter=None):
     """
     Preprocess every real epoch pair once and return parallel arrays.
 
     Heavy FITS work is done a single time and cached to .npz, so the
     train/val/test datasets are cheap index views over the same arrays.
+
+    Processing order per pair:
+        1. fits_to_flat -> raw physical flux f1, f2
+        2. measure_oiii_flux(f1/f2) -> OIII on raw (physically meaningful)
+        3. continuum_subtract(f1/f2) -> remove smooth continuum
+        4. mad_normalize(cs1/cs2) -> robust shape normalisation
+
+    Both raw and MAD-normalised arrays are stored so _two_channel can use raw
+    for ch1 (OIII-normalised amplitude) and mad for ch0 (shape).
     """
     arrays = None
     if cache_path and os.path.exists(cache_path):
         d = np.load(cache_path, allow_pickle=True)
         cached_ok = ("valid1" in d.files
+                     and "raw1" in d.files
                      and d["mad1"].ndim == 2
-                     and d["mad1"].shape[1] == len(MASTER_GRID)
-                     and "repr_continuum_subtracted" in d.files
-                     and bool(d["repr_continuum_subtracted"])
-                     == bool(subtract_continuum))
+                     and d["mad1"].shape[1] == len(MASTER_GRID))
         if cached_ok:
             if verbose:
                 print(f"[pairs] loading cached preprocessing from {cache_path}")
             arrays = {k: d[k] for k in d.files}
         elif verbose:
-            print(f"[pairs] cache {cache_path} is stale (grid, format or continuum mode changed) -- rebuilding")
+            print(f"[pairs] cache {cache_path} is stale (grid or format changed) -- rebuilding")
 
     if arrays is None:
         df = pd.read_pickle(pkl_path)
@@ -319,6 +344,7 @@ def load_or_build_pair_arrays(pkl_path, spectra_dir, cache_path=None,
         has_id = "sdssid" in df.columns
         has_survey = "survey" in df.columns
 
+        raw1, raw2 = [], []
         mad1, mad2 = [], []
         valid1, valid2 = [], []
         oiii1, oiii2, rel1, rel2 = [], [], [], []
@@ -331,18 +357,25 @@ def load_or_build_pair_arrays(pkl_path, spectra_dir, cache_path=None,
             p1 = _resolve(spectra_dir, getattr(row, "specname_dr16"))
             p2 = _resolve(spectra_dir, getattr(row, "specname_sdssv"))
             try:
-                f1, v1 = fits_to_flat(p1, z, subtract_continuum=subtract_continuum)
-                f2, v2 = fits_to_flat(p2, z, subtract_continuum=subtract_continuum)
-                m1, _ = mad_normalize(f1, valid=v1)
-                m2, _ = mad_normalize(f2, valid=v2)
-                o1, s1 = measure_oiii_flux(m1, valid=v1)
-                o2, s2 = measure_oiii_flux(m2, valid=v2)
+                f1, v1 = fits_to_flat(p1, z)
+                f2, v2 = fits_to_flat(p2, z)
+                # Measure OIII on raw physical flux BEFORE any normalisation,
+                # so the amplitude anchor retains its physical meaning.
+                o1, s1 = measure_oiii_flux(f1, valid=v1)
+                o2, s2 = measure_oiii_flux(f2, valid=v2)
+                # Continuum subtraction then MAD normalisation for ch0 shape.
+                cs1 = continuum_subtract(f1, valid=v1)
+                cs2 = continuum_subtract(f2, valid=v2)
+                m1, _ = mad_normalize(cs1, valid=v1)
+                m2, _ = mad_normalize(cs2, valid=v2)
             except Exception as exc:
                 n_fail += 1
                 if verbose and n_fail <= 5:
                     print(f"[pairs] skip row {k}: {exc}")
                 continue
 
+            raw1.append(f1)
+            raw2.append(f2)
             mad1.append(m1)
             mad2.append(m2)
             valid1.append(v1)
@@ -359,6 +392,8 @@ def load_or_build_pair_arrays(pkl_path, spectra_dir, cache_path=None,
                 print(f"[pairs] preprocessed {k + 1:,}/{len(rows):,}")
 
         arrays = {
+            "raw1": np.asarray(raw1, dtype=np.float32),
+            "raw2": np.asarray(raw2, dtype=np.float32),
             "mad1": np.asarray(mad1, dtype=np.float32),
             "mad2": np.asarray(mad2, dtype=np.float32),
             "valid1": np.asarray(valid1, dtype=bool),
@@ -370,7 +405,6 @@ def load_or_build_pair_arrays(pkl_path, spectra_dir, cache_path=None,
             "y": np.asarray(ys, dtype=np.int64),
             "sdssid": np.asarray(ids),
             "survey": np.asarray(surveys),
-            "repr_continuum_subtracted": np.asarray(bool(subtract_continuum)),
         }
         if verbose:
             n = len(arrays["y"])
@@ -459,19 +493,21 @@ class RealPairDataset(Dataset):
 
     def __getitem__(self, i):
         row = self.indices[i]
-        m1 = self.a["mad1"][row].copy()
+        f1 = self.a["raw1"][row]               # raw physical flux (for ch1)
+        f2 = self.a["raw2"][row]
+        m1 = self.a["mad1"][row].copy()        # MAD-normalised (for ch0)
         m2 = self.a["mad2"][row].copy()
         v1 = self.a["valid1"][row]
         v2 = self.a["valid2"][row]
-        o1, r1 = float(self.a["oiii1"][row]), bool(self.a["rel1"][row])
-        o2, r2 = float(self.a["oiii2"][row]), bool(self.a["rel2"][row])
+        o1, rel1 = float(self.a["oiii1"][row]), bool(self.a["rel1"][row])
+        o2, rel2 = float(self.a["oiii2"][row]), bool(self.a["rel2"][row])
         y = int(self.a["y"][row])
 
         # Within-object synthetic positive: suppress broad-line wings on one
-        # epoch. The [OIII] window is untouched, so o1/o2/r1/r2 stay valid.
-        # On the wide grid make_synthetic_change only suppresses broad lines
-        # that are within coverage; if neither is, meta["changed"] is False
-        # and the pair correctly stays labelled static.
+        # epoch's MAD-normalised spectrum. OIII and raw arrays are untouched,
+        # so the amplitude anchor (ch1) correctly reflects the un-changed epoch.
+        # synthetic_prob is 0.0 by default (disabled); this path is dead code
+        # unless explicitly enabled.
         if self.mode == "train" and y == 0 and \
                 self.rng.random() < self.synthetic_prob:
             if self.rng.random() < 0.5:
@@ -481,8 +517,8 @@ class RealPairDataset(Dataset):
             if meta["changed"]:
                 y = 1
 
-        x1 = _two_channel(m1, o1, r1, self.channel1_scale)
-        x2 = _two_channel(m2, o2, r2, self.channel1_scale)
+        x1 = _two_channel(f1, m1, o1, rel1, self.channel1_scale)
+        x2 = _two_channel(f2, m2, o2, rel2, self.channel1_scale)
         return (torch.from_numpy(x1),
                 torch.from_numpy(x2),
                 torch.tensor([y], dtype=torch.float32))

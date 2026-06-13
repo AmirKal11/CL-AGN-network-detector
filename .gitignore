@@ -1,24 +1,23 @@
-# Data (large; sourced from public SDSS / DESI archives — not committed)
+# ── Data ────────────────────────────────────────────────────────────────────
+# Large parquets sourced from public SDSS / DESI archives — not committed.
 data/
+data_trained/
 
-# Regenerable preprocessing caches and any large arrays
+# ── Regenerable caches ──────────────────────────────────────────────────────
+# Pair-array and eval-pair caches are rebuilt automatically on first run.
 *.npz
 
-# Python
+# ── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.egg-info/
 .ipynb_checkpoints/
 
-# Environments
+# ── Environments ────────────────────────────────────────────────────────────
 .venv/
 env/
 venv/
 
-# OS
+# ── OS ──────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
-
-# Model checkpoints / eval artifacts are intentionally committed (lightweight),
-# but exclude any stray large encoder/optimizer dumps if added later:
-# models/**/optimizer_*.pth
