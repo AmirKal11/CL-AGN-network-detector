@@ -21,20 +21,20 @@ backbones.
 Run from the project root:
     python src/train_siamese_v2.py
 
-Produces (under models/clagn_v2/):
-    siamese_changenet.pth    best checkpoint (selected by F0.5 sweep --
-                             see _threshold_sweep + tuple tie-break)
-    siamese_loss_curve.png   focal loss + F0.5/prec/rec/FPR/threshold
+Produces (under out_dir from config_v2.yml):
+    siamese_changenet.pth    best checkpoint (selected by mean per-survey PR-AUC)
+    siamese_loss_curve.png   focal loss + recall/FPR/threshold curves per epoch
 
-Model selection (mirrors v1 train_siamese.py):
-    Each epoch the validation probabilities are scored across thresholds
-    in [0.05, 0.95]. The chosen threshold is the one that:
-        1. has recall >= min_recall  AND  fpr <= max_fpr     (purity gate)
-        2. among survivors, maximises (F0.5, precision, -fpr, recall)
-    If no threshold satisfies the purity gate, the epoch falls back to
-    the best F0.5 over all thresholds. The checkpoint saved is the one
-    that achieved the best (F0.5, precision, -fpr, recall) tuple across
-    all epochs.
+Model selection:
+    Checkpoint: the epoch with the highest MEAN per-survey PR-AUC is saved
+    (each survey weighted equally so the larger DESI count does not outvote
+    SDSS-V). This is the ranking metric — it measures how well the model
+    separates positives from negatives across all deployment surveys.
+
+    Operating threshold: chosen separately on the validation set as the
+    maximum-recall threshold subject to FPR <= max_fpr (from config). This
+    is a deployment parameter — it is reported but never tuned on the
+    held-out test set.
 """
 
 from __future__ import annotations

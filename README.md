@@ -8,45 +8,19 @@
 
 A two-stage deep-learning pipeline that detects a rare astrophysical **state-transition** from pairs of telescope spectra from different surveys — built around **self-supervised pretraining, used for spectra reconstruction**, a **frozen-encoder Siamese head**, and a dynamic per-survey evaluation to detect shortcut learning / data imbalance. Trained on ~85k spectra and reached **PR-AUC 0.832** and **ROC-AUC 0.984**.
 
+## ML Summary
 
+This project demonstrates:
+- self-supervised representation learning with a masked autoencoder
+- Siamese neural networks for paired-input change detection
+- rare-event classification under class imbalance
+- scientific data preprocessing for noisy real-world spectra
+- threshold selection under false-positive constraints
+- interpretability and error analysis for model decisions
 
----
-
-## Scientific introduction and background
-
-Some galaxies' supermassive black holes visibly **change state over just a few years** — a *changing-look AGN* (CL-AGN). These events are rare (currently estimated to be around 1% to 5% of AGN in samples) and scientifically valuable. We can identify one by comparing two spectra (intensity vs. wavelength) of the **same object** taken years apart: emission features appear or vanish. This is called a transition between Type 1 to Type 2 AGN (or vice versa). They are traditionally confirmed by manually fitting the spectra with different existing models and comparing the derived properties. **The goal of this project: train a neural network to flag the transition directly from a pair of spectra, replacing the fitting step which is time consuming and error-prone.**
-
-As a machine-learning problem, that's **binary change-detection on pairs (static vs cl-agn)** under three conditions that make it genuinely hard:
-
-- **Heavy class imbalance** — only a few hundred confirmed positives, against tens of thousands of negatives.
-- **Heavy domain shift** — data comes from four different instruments/surveys, each calibrated differently and introducing unique artifacts and noise patterns.
-- **A self-imposed hard constraint** — no line-fitting / spectral-decomposition allowed anywhere; the network has to *learn* the physics that fitting would otherwise hand it.
+In ML terms, this is a rare-event binary change-detection system trained on paired 1-D signals.
 
 ---
-
-
-
-## Repository layout
-
-```
-src/
-  pretrain_ssl.py           # Stage 1 — self-supervised pretraining
-  train_siamese_v2.py       # Stage 2 — frozen-encoder Siamese, recall-first selection
-  eval_clagn_test.py        # held-out eval: per-source / per-redshift / per-object ranking
-  gradcam_pairs.py          # input-gradient visualisation: TP/FP/TN/FN pair plots
-  plot_ssl_reconstruction.py# SSL reconstruction diagnostic (both channels)
-  architectures_v2.py       # SpectraEncoder, MaskedSpectraAutoencoder, SiameseChangeNet
-  datasets_v2.py            # SSL + real-pair datasets, pair-array cache
-  preprocessing_oiii.py     # 2-channel representation, line anchor, masking, rest-frame grid
-  data_preprocessing.py     # FITS → arrays, sky-line removal, SNR cut, continuum
-  (v1 backbone — see TECHNICAL.md §3)
-config_v2.yml               # pipeline config (paths + hyperparameters)
-models/fixed_OIII/          # current best checkpoint + eval artifacts + interpretability plots
-docs/                       # data inventory + project handoff
-TECHNICAL.md                # full methods note (physics, experiments, ablations, references)
-```
-
-
 
 
 ## Headline results
@@ -58,7 +32,7 @@ TECHNICAL.md                # full methods note (physics, experiments, ablations
 | **Recall** at operating threshold | **88.6%** (31 / 35 confirmed CL-AGN) |
 | **FPR** at operating threshold | **2.4%** (17 / 700 non-CL-AGN flagged) |
 
-Threshold (0.547) was selected on the validation set by maximising **F₂** subject to FPR ≤ 5%, then applied to the held-out test set without modification. This allowed us to find as many positive targets as possible while maintaining a low false-positive rate, which can be later manually inspected.
+Threshold (0.547) was selected on the validation set by maximising **F₂** subject to FPR ≤ 5%, then applied to the held-out test set without modification. This operating point prioritises recovering likely CL-AGN candidates while keeping the false-positive rate low enough for manual follow-up.
 
 <p align="center">
   <img src="models/continuum_subtracted_full_DR7/eval_clagn_test.png" alt="PR curve and confusion matrix — fixed OIII model" width="800"/>
@@ -73,30 +47,19 @@ A separate architecture validation uses the same encoder backbone trained on a s
 </p>
 <p align="center"><em>Left: full spectra — near-perfect classification. Right: emission lines masked — collapses below majority-class baseline, confirming the architecture learns emission line features, not calibration artifacts.</em></p>
 
-### Data representation & training
 
-Each spectrum pair is converted to a **2-channel, 4096-pixel rest-frame array** before any learning:
+## Scientific introduction and background
 
-- **Channel 0** — continuum-subtracted flux, robustly normalised by the median absolute deviation (MAD). This isolates the emission line shapes, making them comparable across objects and epochs regardless of flux calibration differences between instruments.
-- **Channel 1** — The same original flux is divided by the amplitude of the [O III] 5007 Å  emission line, measured on the raw flux before MAD normalisation. Because [O III] is assumed to remain constant during CL-AGN transitions, this channel normalises different flux calibration between different instruments.
+Some galaxies' supermassive black holes visibly **change state over just a few years** — a *changing-look AGN* (CL-AGN). These events are rare (currently estimated to be around 1% to 5% of AGN in samples) and scientifically valuable. We can identify one by comparing two spectra (intensity vs. wavelength) of the **same object** taken years apart: emission features appear or vanish. This is called a transition between Type 1 to Type 2 AGN (or vice versa). They are traditionally confirmed by manually fitting the spectra with different existing models and comparing the derived properties. **The goal of this project is to train a neural network to flag likely CL-AGN transitions directly from paired spectra, reducing the amount of manual fitting required for candidate selection which is time and compute consuming.**
 
-Both channels are arcsinh-compressed to handle the dynamic range of emission-line spikes.
+As a machine-learning problem, that's **binary change-detection on pairs (static vs cl-agn)** under three conditions that make it genuinely hard:
 
-The **Siamese head** is trained with **binary focal loss** (α = 0.5, γ = 2) to down-weight the large number of easy negatives in the heavily imbalanced dataset (≈ 1:7 positive ratio after oversampling). The batch sampler targets **30% positives per batch** (oversampled), and the AdamW head learning rate is 1 × 10⁻³ over 40 epochs with cosine annealing. The encoder is frozen throughout Stage 2, so only the ≈ 500k-parameter MLP head is updated. Checkpoint selection uses **F₂** (which weights recall twice as heavily as precision) — matching the deployment goal of surfacing a short candidate list for human inspection rather than maximising purity.
+- **Heavy class imbalance** — only a few hundred confirmed positives, against tens of thousands of negatives.
+- **Heavy domain shift** — data comes from four different instruments/surveys, each calibrated differently and introducing unique artifacts and noise patterns.
+- **A self-imposed hard constraint** — no line-fitting / spectral-decomposition allowed anywhere; the network has to *learn* the physics that fitting would otherwise hand it.
 
-### Ablations
 
-**Continuum subtraction in ch0.** Two runs were compared — identical architecture, data, and hyperparameters, differing only in whether the smooth continuum was subtracted from ch0 before MAD normalisation:
 
-| Configuration | Recall | FPR | PR-AUC |
-|---|---|---|---|
-| Continuum subtracted + MAD (full DR7) | **88.6%** (31/35) | 2.4% | **0.832** |
-| Raw flux + MAD only (full DR7) | 80.0% (28/35) | 2.6% | 0.812 |
-| Continuum subtracted + SDSS-V weighted SSL loss (full DR7) | TBD | TBD | TBD |
-
-Continuum subtraction isolates emission line shapes from the slowly-varying flux baseline, giving the encoder a cleaner signal to reconstruct and the Siamese head a sharper change feature to detect. The 8-point recall difference confirms it is a meaningful preprocessing choice for this task.
-
----
 
 ## Technical approach
 
@@ -113,6 +76,34 @@ Continuum subtraction isolates emission line shapes from the slowly-varying flux
 The central bottleneck is label scarcity: a few hundred confirmed CL-AGN against tens of thousands of negatives, with no way to cheaply generate more positives — these are rare real events. Even Type1 / Type2 labels are scarce and depend on catalogues created by other researchers.
  The solution is to separate *representation learning* from *classification*: a masked autoencoder pretrained on ~80k unlabeled spectra learns a general spectral encoder without ever seeing a label, then a small Siamese head trained on the scarce labeled pairs handles the actual detection. The encoder learns from the data that's abundant; the classifier only needs to learn from what's rare. 
 
+---
+
+### Data representation & training
+
+Each spectrum pair is converted to a **2-channel, 4096-pixel rest-frame array** before any learning:
+
+- **Channel 0** — continuum-subtracted flux, robustly normalised by the median absolute deviation (MAD). This isolates the emission line shapes, making them comparable across objects and epochs regardless of flux calibration differences between instruments.
+- **Channel 1** — The same original flux is divided by the amplitude of the [O III] 5007 Å  emission line, measured on the raw flux before MAD normalisation. Because [O III] is assumed to remain constant during CL-AGN transitions, this channel normalises different flux calibration between different instruments.
+
+Both channels are arcsinh-compressed to handle the dynamic range of emission-line spikes.
+
+The **Siamese head** is trained with **binary focal loss** (α = 0.5, γ = 2) to down-weight the large number of easy negatives in the heavily imbalanced dataset (≈ 1:7 positive ratio after oversampling). The batch sampler targets **30% positives per batch** (oversampled), and the AdamW head learning rate is 1 × 10⁻³ over 40 epochs with cosine annealing. The encoder is frozen throughout Stage 2, so only the ≈ 500k-parameter MLP head is updated. Checkpoint selection uses **F₂** (which weights recall twice as heavily as precision) — matching the deployment goal of surfacing a short candidate list for human inspection rather than maximising purity.
+
+### Testing various datasets and data preprocessing
+
+**Continuum subtraction in ch0.** Two runs were compared — identical architecture, data, and hyperparameters, differing only in whether the smooth continuum was subtracted from ch0 before MAD normalisation:
+
+| Configuration | Recall | FPR | PR-AUC |
+|---|---|---|---|
+| Continuum subtracted + MAD (full DR7) | **88.6%** (31/35) | 2.4% | **0.832** |
+| Raw flux + MAD only (full DR7) | 80.0% (28/35) | 2.6% | 0.812 |
+| Continuum subtracted + SDSS-V weighted SSL loss (full DR7) | TBD | TBD | TBD |
+
+Continuum subtraction isolates emission line shapes from the slowly-varying flux baseline, giving the encoder a cleaner signal to reconstruct and the Siamese head a sharper change feature to detect. The 8-point recall difference confirms it is a meaningful preprocessing choice for this task.
+
+---
+
+`
 ## Repository layout
 
 ```
@@ -133,11 +124,9 @@ models/
   continuum_subtracted_full_dr7/  # best model (PR-AUC 0.832) — checkpoints + eval artifacts
   raw_continuum_full_dr7/         # ablation: no continuum subtraction (PR-AUC 0.812)
   raw_continuum_dr7_capped/       # ablation: capped DR7 SSL pool
-docs/                       # data inventory + project handoff
-TECHNICAL.md                # full methods note (physics, experiments, ablations, references)
 ```
 
-The survey-specific catalog-building and download code is not included; how the training inputs were constructed is documented in [`docs/DATA_INVENTORY.md`](docs/DATA_INVENTORY.md).
+
 
 ### Running inference on new data
 
