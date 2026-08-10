@@ -2,6 +2,8 @@
 # Large parquets sourced from public SDSS / DESI archives — not committed.
 data/
 data_trained/
+results/
+
 
 # ── Regenerable caches ──────────────────────────────────────────────────────
 # Pair-array and eval-pair caches are rebuilt automatically on first run.
@@ -12,6 +14,18 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .ipynb_checkpoints/
+move_spectra.py
+verify_resolve.py
+src/download_missing_spectra.py
+src/Testing.ipynb
+src/sample_and_plot.py
+src/crossmatch.py
+src/filter_agn_pairs.py
+src/dr16_dr20_bhm_crossmatch_3arcsec.csv
+diagnose_test_spectra.py
+src/analyze_v4_data.py
+src/plot_ranker_gain.py
+src/rebuild_ssl_parquet_raw.py
 
 # ── Environments ────────────────────────────────────────────────────────────
 .venv/
@@ -26,3 +40,9 @@ Thumbs.db
 docs/HANDOFF.md
 docs/PIPELINE.md
 TECHNICAL.md
+INTERVIEW_PREP.md
+DISCREPANCY_LOG.md
+Project_presentation_fixed.pptx
+Project_presentation_with_notes.pptx
+
+.claude/

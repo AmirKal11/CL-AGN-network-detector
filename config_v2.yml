@@ -7,25 +7,60 @@ paths:
   _legacy_data: &LEGACY "/Users/amir/Documents/Deep learning/cl-agn classifier -Legacy version/data_v4"
 
   ssl_parquets:
-    # DR7 capped at 12k/type (~24k total) — more balanced survey exposure.
-    # Built by: conda run -n astro_dl python src/cap_dr7_parquet.py
-    - "/Users/amir/Documents/Deep learning/cl-agn-classifier/data/ssl_all_spectra_uncapped_DR7.parquet"
+    # FULL, UNCAPPED DR7 (~82,006 spectra; see norm_stats.json n_spectra).
+    # NOTE: capping DR7 at 12k/type was tried and REJECTED — it dropped the
+    # pool to 58,424 and hurt performance (README, "Capping DR7 at 24k
+    # spectra"). The capped parquet is built by src/cap_dr7_parquet.py and is
+    # NOT used here.
+    - '/data_trained/ssl_all_spectra_uncapped_DR7.parquet'
   # Stage 2: real same-object epoch pairs.
   pair_pickle: "/Users/amir/Documents/Deep learning/cl-agn classifier -Legacy version/data_v4/dr16_sdssv_phase2_train.pkl"
   pair_spectra_dir: "/Users/amir/Documents/Deep learning/cl-agn classifier -Legacy version/data_v4"
   # Held-out unseen test (used by the eval script, not by the trainer).
   clagn_test_pickle: "/Users/amir/Documents/Deep learning/cl-agn classifier -Legacy version/data_v4/clagn_test.pkl"
   clagn_test_spectra_dir: "/Users/amir/Documents/Deep learning/cl-agn classifier -Legacy version/data_v4"
-  # Outputs.
-  #   sdssv_weighted (this run)      : models/sdssv_weighted       <-- active
-  #   fixed_OIII (best so far)       : models/fixed_OIII
-  #   raw_continuum (no cont. sub.)  : models/raw_continuum_full_dr7
-  #   v4 (confound-free, SDSS-V)    : models/clagn_v4  (baseline)
-  out_dir: models/sdssv_weighted
-  norm_stats: models/sdssv_weighted/norm_stats.json
-  pair_cache: models/sdssv_weighted/pair_arrays_cache.npz
-  ssl_checkpoint: models/sdssv_weighted/ssl_encoder.pth
-  siamese_checkpoint: models/sdssv_weighted/siamese_changenet.pth
+  # ---- Model directory -------------------------------------------------
+  # These five keys are OVERLOADED — they mean different things per script:
+  #   pretrain_ssl.py / train_siamese_v2.py : WRITE destination
+  #   eval_clagn_test.py / gradcam_pairs.py : READ location (load ckpt from
+  #                                           here, then write results here)
+  # There is no separate "which model to evaluate" key.
+  #
+  # !! WARNING !! These point at the FINAL model. Running pretrain_ssl.py or
+  # train_siamese_v2.py as-is will OVERWRITE it. Point all five at a NEW
+  # directory before training anything.
+  #
+  # Model dirs on disk — held-out test metrics, from each eval_clagn_test.json.
+  # NOTE "best" = recall-first under an inspection budget, NOT best PR-AUC:
+  #
+  #   continuum_subtracted_full_dr7  <-- FINAL / DEPLOYED
+  #        continuum-subtracted ch0, 82,006 SSL pool, no loss weighting
+  #        PR-AUC 0.832  ROC-AUC 0.984  recall 88.6% (31/35)  FPR 2.4% (17/700)
+  #        (was models/fixed_OIII — renamed on disk; see docs/MODELS.md)
+  #   weighted_loss_per_Z            REJECTED — per-z-bin SSL loss weighting
+  #        PR-AUC 0.875 (higher!) but recall 71.4% (25/35), FPR 0.3%
+  #        Rejected on the mixture-fit evidence, not on test metrics.
+  #   sdssv_weighted                 ablation — sdssv/dr16 x3 SSL loss weighting
+  #        PR-AUC 0.842  recall 62.9% (22/35)  FPR 0.4%
+  #        This is the run the survey_loss_weights block below belongs to.
+  #   raw_continuum_full_dr7         ablation — NO continuum subtraction
+  #        PR-AUC 0.790  recall 77.1% (27/35)  FPR 2.4%
+  #        Control arm for the continuum ablation: same 82,006 pool, same
+  #        channel1_scale, ch0 raw. Worth +11.4 recall points to subtract.
+  #   raw_continuum_dr7_capped       ablation — no cont. sub. AND capped pool
+  #        PR-AUC 0.812  recall 80.0% (28/35)  FPR 2.6%   (58,424 spectra)
+  #        Varies TWO factors; not a valid continuum-subtraction comparison.
+  #        (was models/raw_continuum — renamed on disk)
+  #
+  # CAVEAT: the ssl:/siamese: blocks below are NOT known to be the values that
+  # produced the final model — no config snapshot was saved with it, and these
+  # were last edited for the rejected weighted_loss_per_Z run. This file
+  # locates the final model; it does not reproduce it. See docs/MODELS.md.
+  out_dir: models/continuum_subtracted_full_dr7
+  norm_stats: models/continuum_subtracted_full_dr7/norm_stats.json
+  pair_cache: models/continuum_subtracted_full_dr7/pair_arrays_cache.npz
+  ssl_checkpoint: models/continuum_subtracted_full_dr7/ssl_encoder.pth
+  siamese_checkpoint: models/continuum_subtracted_full_dr7/siamese_changenet.pth
 
 preprocessing:
   oiii_snr_min: 4.0          # below this the [OIII] channel falls back to MAD
@@ -42,8 +77,16 @@ ssl:                          # Stage 1 -- masked-reconstruction pretraining
   max_rows: null             # cap the SSL pool (null = use everything)
   num_workers: 0             # data is in-memory; workers would just copy it
   seed: 42
-  # Per-survey loss weights — upweight deployment surveys to reduce domain gap.
-  # Set all to 1.0 to disable. sdssv/dr16 get 3x more gradient signal than dr7/desi.
+  # DEAD — nothing reads this key (`grep -rn survey_loss_weights src/` = 0 hits).
+  # It is a fossil of the models/sdssv_weighted run. Setting all to 1.0 does NOT
+  # disable per-survey weighting.
+  #
+  # The weighting that actually runs is the REJECTED per-z-bin scheme, hardcoded
+  # as class constants in datasets_v2.py:281-286 (Z_BIN_WIDTH / REFERENCE_
+  # SURVEYS / DOWNWEIGHT_SURVEYS / WEIGHT_FLOOR), applied unconditionally in
+  # _build_sample_weights() and consumed by the SSL loss at pretrain_ssl.py:414.
+  # => Stage 1 currently reproduces weighted_loss_per_Z, not the final model.
+  #    Disabling it requires editing datasets_v2.py, not this file.
   survey_loss_weights:
     sdssv:    3.0
     dr16:     3.0
@@ -70,24 +113,35 @@ siamese:                      # Stage 2 -- change detector on real pairs
                              # exposure per batch). WeightedRandomSampler target.
   source_balanced: true      # v4: split positive mass EQUALLY across surveys so
                              # the head sees scarce SDSS-V positives as often as DESI.
-  # v4: checkpoint selected on the MEAN of per-survey PR-AUC (each survey weighted
-  # equally so the larger DESI count doesn't drown SDSS-V); deployment threshold
-  # taken on the SDSS-V subset at FPR<=max_fpr. (select_survey_stage2 is now unused.)
-  select_survey_stage2: sdssv
+  # Two SEPARATE decisions, both hardcoded in train_siamese_v2.py, neither read
+  # from this file:
+  #   checkpoint <- max mean per-survey PR-AUC, surveys weighted equally so the
+  #                 larger DESI count doesn't drown SDSS-V   (lines 459, 490)
+  #   threshold  <- max recall s.t. FPR <= max_fpr, on the SDSS-V subset only
+  #                 (line 465); op_survey = "sdssv" is a string literal at
+  #                 line 405 — NOT sourced from select_survey_stage2.
+  select_survey_stage2: sdssv   # DEAD — 0 readers in src/
   val_frac: 0.15
   test_frac: 0.0             # no internal test -- clagn_test.pkl is the held-out test
-  decision_threshold: 0.5    # only used by downstream scripts; the trainer
-                             # ignores this and picks its own threshold via
-                             # the F-beta sweep below.
-  # ---- F-beta threshold sweep (mirrors train_siamese.py / v1) ---------
-  # Each epoch the chosen threshold is the one that:
-  #   1. has recall >= min_recall  AND  fpr <= max_fpr
-  #   2. among survivors, maximises (fbeta, precision, -fpr, recall)
-  # If no threshold passes step 1, fall back to argmax fbeta and flag it.
-  fbeta_beta: 2.0            # v4 recall-first: F2 weights RECALL 2x over precision
-                             # (candidate ranker; threshold is a deployment param
-                             # tuned on new data, never on the held-out test).
-  min_recall: 0.30           # v4: require >=30% TPR (was 0.10)
-  max_fpr:    0.05           # v4: allow up to 5% FPR (was 0.01) -- purity relaxed
+  decision_threshold: 0.5    # UNUSED by the trainer. NOT an F-beta sweep —
+                             # the trainer calls _recall_at_fpr() and takes the
+                             # max-recall threshold s.t. FPR <= max_fpr on the
+                             # SDSS-V val subset (train_siamese_v2.py:465).
+                             # Downstream (eval_clagn_test.py:342,
+                             # gradcam_pairs.py:224) this is only a FALLBACK
+                             # for checkpoints lacking "best_threshold".
+                             # Deployed value is 0.547, stored in the ckpt.
+  # ---- Threshold selection --------------------------------------------
+  # LIVE:  max_fpr        -> _recall_at_fpr(probs, labels, max_fpr)
+  # DEAD:  fbeta_beta, min_recall  -> read at train_siamese_v2.py:394-395 and
+  #        written into checkpoint metadata ONLY. They constrain nothing.
+  #
+  # The F-beta sweep they describe lives in _threshold_sweep() (line 159) and
+  # is NEVER CALLED during training — it is diagnostic-only, invoked from
+  # eval_clagn_test.py. Its rule (recall >= min_recall AND fpr <= max_fpr,
+  # then maximise fbeta) does NOT set the deployed threshold.
+  fbeta_beta: 2.0            # DEAD (ckpt metadata only) — diagnostic F2
+  min_recall: 0.30           # DEAD (informational only) — not enforced anywhere
+  max_fpr:    0.05           # LIVE — inspection-budget ceiling; the one real knob
   num_workers: 0             # pairs are preprocessed once into RAM
   seed: 42

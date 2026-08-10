@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1560 640" width="1560" height="640" font-family="Helvetica Neue, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5b6b7c"/>
+    </marker>
+    <style>
+      .card  { fill:#ffffff; stroke:#c3cedb; stroke-width:2; rx:10; }
+      .ghost { fill:#eef3f8; stroke:#c3cedb; stroke-width:2; rx:10; }
+      .net   { fill:#f3efff; stroke:#8b73d6; stroke-width:2.5; rx:10; }
+      .out   { fill:#e9f7ef; stroke:#3f9e6b; stroke-width:2.5; rx:10; }
+      .num   { fill:#2f6fb0; font-size:15px; font-weight:700; }
+      .h     { font-size:19px; font-weight:700; fill:#1b2733; }
+      .s     { font-size:14px; fill:#4a5a6a; }
+      .m     { font-size:13.5px; fill:#2f6fb0; font-weight:600; }
+      .lbl   { font-size:14px; fill:#5b6b7c; font-style:italic; }
+      .arrow { stroke:#5b6b7c; stroke-width:2.5; fill:none; marker-end:url(#arrow); }
+      .title { font-size:24px; font-weight:700; fill:#1b2733; }
+    </style>
+  </defs>
+
+  <text class="title" x="60" y="46">Spectrum pre-processing: FITS file &#8594; P(changing-look)</text>
+  <text class="lbl" x="60" y="72">every step below is applied identically and independently to each of the two epochs (shared, no learned parameters)</text>
+
+  <!-- ============ ROW 1: five preprocessing stages ============ -->
+  <!-- 1 -->
+  <rect class="ghost" x="70" y="110" width="250" height="190" rx="10"/>
+  <rect class="card"  x="60" y="100" width="250" height="190" rx="10"/>
+  <text class="num" x="80" y="128">1</text>
+  <text class="h"   x="80" y="152">FITS file</text>
+  <text class="s"   x="80" y="180">one observed spectrum:</text>
+  <text class="s"   x="80" y="200">flux vs. wavelength,</text>
+  <text class="s"   x="80" y="220">non-uniform grid, ~4600 px</text>
+  <text class="m"   x="80" y="266">float vector, variable length</text>
+
+  <path class="arrow" d="M 322 195 L 350 195"/>
+
+  <!-- 2 -->
+  <rect class="ghost" x="365" y="110" width="250" height="190" rx="10"/>
+  <rect class="card"  x="355" y="100" width="250" height="190" rx="10"/>
+  <text class="num" x="375" y="128">2</text>
+  <text class="h"   x="375" y="152">Align &#38; resample</text>
+  <text class="s"   x="375" y="180">shift to rest frame (&#955;/1+z),</text>
+  <text class="s"   x="375" y="200">interpolate onto one fixed</text>
+  <text class="s"   x="375" y="220">grid; pad + validity mask</text>
+  <text class="m"   x="375" y="266">[4096]&#8195;fixed length</text>
+
+  <path class="arrow" d="M 617 195 L 645 195"/>
+
+  <!-- 3 -->
+  <rect class="ghost" x="660" y="110" width="250" height="190" rx="10"/>
+  <rect class="card"  x="650" y="100" width="250" height="190" rx="10"/>
+  <text class="num" x="670" y="128">3</text>
+  <text class="h"   x="670" y="152">Detrend</text>
+  <text class="s"   x="670" y="180">subtract a 173-px moving</text>
+  <text class="s"   x="670" y="200">average = smooth baseline,</text>
+  <text class="s"   x="670" y="220">keeping the peak structure</text>
+  <text class="m"   x="670" y="266">[4096]</text>
+
+  <path class="arrow" d="M 912 195 L 940 195"/>
+
+  <!-- 4 -->
+  <rect class="ghost" x="955" y="110" width="250" height="190" rx="10"/>
+  <rect class="card"  x="945" y="100" width="250" height="190" rx="10"/>
+  <text class="num" x="965" y="128">4</text>
+  <text class="h"   x="965" y="152">Normalize</text>
+  <text class="s"   x="965" y="180">two channels are built:</text>
+  <text class="s"   x="965" y="202"><tspan font-weight="700">ch0</tspan> robust (MAD) scaling</text>
+  <text class="s"   x="965" y="224"><tspan font-weight="700">ch1</tspan> divide by a reference</text>
+  <text class="s"   x="965" y="244">peak that cannot vary in time</text>
+  <text class="m"   x="965" y="274">[2, 4096]</text>
+
+  <path class="arrow" d="M 1207 195 L 1235 195"/>
+
+  <!-- 5 -->
+  <rect class="ghost" x="1250" y="110" width="250" height="190" rx="10"/>
+  <rect class="card"  x="1240" y="100" width="250" height="190" rx="10"/>
+  <text class="num" x="1260" y="128">5</text>
+  <text class="h"   x="1260" y="152">arcsinh compression</text>
+  <text class="s"   x="1260" y="180">log-like squash of the heavy</text>
+  <text class="s"   x="1260" y="200">tail; keeps sign and relative</text>
+  <text class="s"   x="1260" y="220">amplitude, defined at 0</text>
+  <text class="m"   x="1260" y="266">[2, 4096]&#8195;network input</text>
+
+  <!-- ============ elbow into row 2 ============ -->
+  <path class="arrow" d="M 1365 302 L 1365 340 L 260 340 L 260 388"/>
+
+  <!-- ============ ROW 2: two epochs -> network -> probability ============ -->
+  <rect class="card" x="60" y="390" width="200" height="86" rx="10"/>
+  <text class="h" x="80" y="422">Epoch A</text>
+  <text class="m" x="80" y="450">x&#8321; : [2, 4096]</text>
+
+  <rect class="card" x="60" y="500" width="200" height="86" rx="10"/>
+  <text class="h" x="80" y="532">Epoch B</text>
+  <text class="m" x="80" y="560">x&#8322; : [2, 4096]</text>
+
+  <path class="arrow" d="M 262 433 L 330 433"/>
+  <path class="arrow" d="M 262 543 L 330 543"/>
+
+  <rect class="net" x="340" y="390" width="740" height="196" rx="10"/>
+  <text class="h" x="365" y="424">Siamese network</text>
+  <text class="s" x="365" y="452">shared-weight 1D encoder (CNN + transformer), self-supervised pre-training</text>
+  <text class="s" x="365" y="474">on unlabeled spectra&#8195;&#8594;&#8195;512-d embedding per epoch</text>
+  <text class="s" x="365" y="508">symmetric fusion&#8195;[ e&#8321;+e&#8322; , |e&#8321;&#8722;e&#8322;| , e&#8321;&#8857;e&#8322; ]&#8195;&#8594;&#8195;[1536]&#8195;&#8594;&#8195;MLP head</text>
+  <text class="m" x="365" y="546">output: 1 logit</text>
+  <text class="lbl" x="365" y="570">order-invariant by construction: swapping the two epochs cannot change the output</text>
+
+  <path class="arrow" d="M 1082 488 L 1150 488"/>
+
+  <rect class="out" x="1160" y="428" width="330" height="120" rx="10"/>
+  <text class="h" x="1185" y="464">&#963;(logit) &#8594; P(change)</text>
+  <text class="s" x="1185" y="492">score in [0, 1]; threshold is a</text>
+  <text class="s" x="1185" y="512">deployment knob &#8212; the model is</text>
+  <text class="s" x="1185" y="532">used as a recall-first candidate ranker</text>
+</svg>

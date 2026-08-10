@@ -241,6 +241,29 @@ def main():
         print(f"[ssl] WARNING: no {select_surveys} spectra in val; "
               f"selecting on global val instead")
 
+    # ---- per-(survey x z-bin) val diagnostics --------------------------
+    # A single ordered pass over the val set, bucketing masked-recon error by
+    # survey AND Δz=0.1 redshift bin. This gives: (a) one val-MSE curve per
+    # survey, and (b) the z-MATCHED breakdown — does DR7 reconstruct better
+    # than SDSS-V/DR16 *at the same redshift* (a true instrument/domain gap),
+    # or only because it lives in the easy low-z region (a composition artifact)?
+    Z_BIN_WIDTH = float(dataset.Z_BIN_WIDTH)
+    Z_MAX       = float(dataset.Z_MAX)
+    N_ZBINS     = int(np.ceil(Z_MAX / Z_BIN_WIDTH))
+    _all_z      = np.asarray(dataset.meta["z"].to_numpy(), dtype=float)
+    _zc         = np.clip(_all_z, 0.0, Z_MAX - 1e-9)
+    all_zbin    = np.where(np.isfinite(_all_z),
+                           np.floor(_zc / Z_BIN_WIDTH).astype(int), -1)
+    val_survey_arr = np.asarray([str(x) for x in all_surveys[val_idx]])
+    val_zbin_arr   = all_zbin[val_idx]
+    val_surveys    = sorted(set(val_survey_arr.tolist()))
+    # Fixed, ordered val loader (no shuffle) so batch order maps back to val_idx.
+    cell_val_loader = DataLoader(
+        Subset(dataset, val_idx.tolist()),
+        batch_size=s["batch_size"], shuffle=False, num_workers=s["num_workers"])
+    print(f"[ssl] per-survey/z-bin val curves: "
+          + ", ".join(f"{k}={int((val_survey_arr == k).sum())}" for k in val_surveys))
+
     # ---- replay sampler (50/50 old:new) for continual pretraining -----
     if args.replay:
         # SSLSpectraDataset carries .meta with a 'survey' column for every row.
@@ -324,7 +347,9 @@ def main():
     # ---- pre-training input sanity check --------------------------------
     plot_input_sample(dataset, out_dir)
 
-    history = {"train": [], "val": [], "sel_val": []}
+    history = {"train": [], "val": [], "sel_val": [],
+               "survey": {k: [] for k in val_surveys},
+               "cells": []}   # each entry: [n_surveys, N_ZBINS] MSE matrix
     best_val = float("inf")
 
     def _val_loss(loader):
@@ -339,6 +364,40 @@ def main():
                 vrun += masked_mse(model(x_masked), x, span, valid).item()
                 vnb += 1
         return vrun / max(vnb, 1)
+
+    def _val_cells():
+        """One ordered pass over the val set -> pooled masked-recon MSE per
+        (survey, z-bin). Returns (per_survey dict, [n_surveys, N_ZBINS] matrix)."""
+        se  = {sv: np.zeros(N_ZBINS) for sv in val_surveys}   # sum of sq error
+        cnt = {sv: np.zeros(N_ZBINS) for sv in val_surveys}   # contributing terms
+        model.eval()
+        pos = 0
+        with torch.no_grad():
+            for batch in cell_val_loader:
+                x, valid = batch[0].to(device), batch[1].to(device)
+                x_masked, span = apply_span_mask(x, valid, s["mask_ratio"],
+                                                 s["min_span"], s["max_span"])
+                recon = model(x_masked)
+                m  = (span & valid).unsqueeze(1).float()          # [B,1,L]
+                se_b  = ((recon - x) ** 2 * m).sum(dim=(1, 2)).cpu().numpy()  # [B]
+                cnt_b = (m.sum(dim=(1, 2)).cpu().numpy()
+                         * recon.shape[1])                        # pixels * C
+                bs = se_b.shape[0]
+                for j in range(bs):
+                    sv = val_survey_arr[pos + j]
+                    b  = int(val_zbin_arr[pos + j])
+                    if b < 0 or sv not in se:
+                        continue
+                    se[sv][b]  += float(se_b[j])
+                    cnt[sv][b] += float(cnt_b[j])
+                pos += bs
+        per_survey, mat = {}, np.full((len(val_surveys), N_ZBINS), np.nan)
+        for r, sv in enumerate(val_surveys):
+            tot_se, tot_ct = se[sv].sum(), cnt[sv].sum()
+            per_survey[sv] = float(tot_se / tot_ct) if tot_ct > 0 else float("nan")
+            nz = cnt[sv] > 0
+            mat[r, nz] = se[sv][nz] / cnt[sv][nz]
+        return per_survey, mat
 
     # ---- training loop --------------------------------------------------
     for epoch in range(s["num_epochs"]):
@@ -364,14 +423,31 @@ def main():
         val_loss = _val_loss(val_loader)
         # v4: selection metric = recon val on SDSS-V+DR16 only (falls back to global)
         sel_val = _val_loss(sel_val_loader) if sel_val_loader is not None else val_loss
+        per_survey_val, cell_mat = _val_cells()
         sched.step()
 
         history["train"].append(train_loss)
         history["val"].append(val_loss)
         history["sel_val"].append(sel_val)
+        for k, v in per_survey_val.items():
+            history["survey"][k].append(v)
+        history["cells"].append(cell_mat)
         print(f"[ssl] epoch {epoch + 1:3d}/{s['num_epochs']}  "
               f"train {train_loss:.5f}  val {val_loss:.5f}  "
               f"sel_val {sel_val:.5f}  ({time.time() - t0:.0f}s)")
+        if per_survey_val:
+            print("[ssl]   per-survey val: "
+                  + "  ".join(f"{k} {per_survey_val[k]:.4f}"
+                              for k in per_survey_val))
+            # z-MATCHED table: rows = survey, cols = z-bin lower edge
+            hdr = "  ".join(f"{b * Z_BIN_WIDTH:>4.1f}" for b in range(N_ZBINS))
+            print(f"[ssl]   z-matched val MSE   z: {hdr}")
+            for r, sv in enumerate(val_surveys):
+                cells = "  ".join(
+                    (f"{cell_mat[r, b]:>4.2f}" if np.isfinite(cell_mat[r, b])
+                     else "  --")
+                    for b in range(N_ZBINS))
+                print(f"[ssl]     {sv:<9}: {cells}")
 
         if sel_val < best_val:
             best_val = sel_val
@@ -385,17 +461,54 @@ def main():
             print(f"[ssl]   saved best encoder (sel_val={sel_val:.5f}) -> {ckpt_path}")
 
     # ---- loss curve -----------------------------------------------------
-    plt.figure(figsize=(8, 5))
-    plt.plot(history["train"], label="train")
-    plt.plot(history["val"], label="val (global)")
-    plt.plot(history["sel_val"], label=f"val ({'+'.join(select_surveys)}) [selection]")
+    plt.figure(figsize=(9, 5.5))
+    plt.plot(history["train"], label="train", color="0.3", lw=1.2)
+    plt.plot(history["val"], label="val (global)", color="0.6", lw=1.2)
+    survey_styles = {
+        "sdssv":    ("#d62728", "SDSS-V"),
+        "dr16":     ("#2ca02c", "DR16"),
+        "desi":     ("#1f77b4", "DESI"),
+        "sdss_dr7": ("#9467bd", "DR7"),
+    }
+    for surv in history["survey"]:
+        color, label = survey_styles.get(surv, (None, surv))
+        plt.plot(history["survey"][surv], label=f"val ({label})", color=color, lw=1.4)
+    if sel_val_loader is not None:
+        plt.plot(history["sel_val"], color="k", ls="--", lw=1.0,
+                 label=f"val ({'+'.join(select_surveys)}) [selection]")
     plt.xlabel("epoch")
     plt.ylabel("masked reconstruction MSE")
-    plt.title("Stage 1 -- self-supervised pretraining")
-    plt.legend()
+    plt.title("Stage 1 -- self-supervised pretraining (per-survey validation)")
+    plt.legend(fontsize=8)
     plt.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "ssl_loss_curve.png"), dpi=150)
+
+    # ---- z-matched val MSE heatmap (final epoch) ------------------------
+    # Survey x z-bin reconstruction MSE. If DR7 is uniformly lower ACROSS bins,
+    # it's a true domain gap; if rows converge within each column, the apparent
+    # gap was just redshift/type composition.
+    if history["cells"]:
+        mat = history["cells"][-1]                 # [n_surveys, N_ZBINS]
+        fig, ax = plt.subplots(figsize=(1.1 * N_ZBINS + 2, 0.7 * len(val_surveys) + 2))
+        im = ax.imshow(mat, aspect="auto", cmap="viridis")
+        ax.set_xticks(range(N_ZBINS))
+        ax.set_xticklabels([f"{b * Z_BIN_WIDTH:.1f}" for b in range(N_ZBINS)])
+        ax.set_yticks(range(len(val_surveys)))
+        ax.set_yticklabels([survey_styles.get(sv, (None, sv))[1] for sv in val_surveys])
+        ax.set_xlabel("redshift bin (lower edge)")
+        ax.set_title("z-matched val reconstruction MSE (final epoch)")
+        for r in range(mat.shape[0]):
+            for c in range(mat.shape[1]):
+                if np.isfinite(mat[r, c]):
+                    ax.text(c, r, f"{mat[r, c]:.2f}", ha="center", va="center",
+                            color="w", fontsize=7)
+        fig.colorbar(im, ax=ax, label="masked recon MSE")
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "ssl_zmatched_val.png"), dpi=150)
+        print(f"[ssl] z-matched val heatmap -> "
+              f"{os.path.join(out_dir, 'ssl_zmatched_val.png')}")
+
     print(f"[ssl] done. best selection val loss = {best_val:.5f}")
     print(f"[ssl] encoder ready for Stage 2: {ckpt_path}")
 

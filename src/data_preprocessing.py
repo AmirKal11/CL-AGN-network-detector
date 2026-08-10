@@ -158,7 +158,7 @@ def morphological_continuum_subtraction(
     subtract_continuum: bool = True,
 ) -> torch.Tensor:
     """
-    Wide moving-average continuum removal + optional MAD scaling + edge taper.
+    Wide moving-average continuum removal + optional MAD scaling + edge taper. Currently dead
 
     x shape: [B, 1, L]
     """
@@ -284,6 +284,15 @@ def process_single_spectrum(
 
             return {
                 "flux_array": flux_array,
+                # Coverage mask as computed here (isfinite on the interpolated
+                # grid) -- the SAME convention datasets_v2.fits_to_flat stores
+                # in the pair cache. Callers must use this rather than
+                # reconstructing it with valid_from_flux(flux != 0), because
+                # SDSS-V reductions write exactly 0.0 for masked pixels that
+                # ARE inside coverage; the two conventions disagree there and
+                # a zero pixel landing in an [O III] band shifts the measured
+                # flux (and hence the channel-1 scale).
+                "valid": valid.astype(bool),
                 "valid_frac": float(valid.mean()),
                 "snr": snr,
                 "z": float(z),

@@ -10,7 +10,7 @@ Loads:
       with a `source` column distinguishing paper2 / lowz / phase2_neg.
 
 Reports:
-    - Overall F0.5 / precision / recall / FPR / AUC / TP-FP-TN-FN at the
+    - Overall F2 / PR-AUC / recall
       training-time saved threshold.
     - Full threshold sweep on the held-out test, with the gate-+-tie-break
       logic applied for reference -- this is the post-hoc "optimum if we
@@ -55,7 +55,7 @@ from train_siamese_v2 import _threshold_sweep, _auc
 def _metrics_at_threshold(probs: np.ndarray,
                           labels: np.ndarray,
                           threshold: float,
-                          beta: float = 0.5) -> dict:
+                          beta: float = 2.0) -> dict:
     """
     Full set of binary-classification metrics at a single threshold.
 
@@ -342,9 +342,9 @@ def main():
         "best_threshold", s.get("decision_threshold", 0.5)
     ))
     saved_metrics = ckpt.get("best_threshold_metrics", None)
-    fbeta_beta = float(ckpt.get("fbeta_beta", s.get("fbeta_beta", 0.5)))
+    fbeta_beta = float(ckpt.get("fbeta_beta", s.get("fbeta_beta", 2.0)))
     min_recall = float(ckpt.get("min_recall", s.get("min_recall", 0.10)))
-    max_fpr    = float(ckpt.get("max_fpr",    s.get("max_fpr",    0.01)))
+    max_fpr    = float(ckpt.get("max_fpr",    s.get("max_fpr",    0.05)))
     print(f"[eval] checkpoint: epoch={ckpt.get('epoch','?')}  "
           f"saved threshold={saved_threshold:.3f}  "
           f"fbeta_beta={fbeta_beta}  min_recall={min_recall}  max_fpr={max_fpr}")
@@ -426,7 +426,7 @@ def main():
     print(f"  FPR         = {saved['fpr']:.4f}")
     print(f"  FNR         = {saved['fnr']:.4f}")
     print(f"  F{fbeta_beta}        = {saved['fbeta']:.4f}   "
-          f"(primary -- prioritises precision)")
+          f"(primary -- prioritises recall)")
     print(f"  F1          = {saved['f1']:.4f}")
     print(f"  AUC         = {auc:.4f}")
 
@@ -480,6 +480,17 @@ def main():
         ax.scatter([saved["recall"]], [saved["precision"]],
                    color="#c0392b", s=70, zorder=5,
                    label=f"thr={saved_threshold:.2f}")
+    # No-skill baseline: a random ranker has precision = prevalence at every
+    # recall, so its AP equals the positive rate. PR-AUC has no fixed floor
+    # (unlike ROC's 0.5), so the curve is unreadable without this reference.
+    base_rate = float(np.mean(labels))
+    ax.axhline(base_rate, ls="--", lw=1.6, color="#7f8c8d",
+               label=f"random ranking = {base_rate:.3f}")
+    if base_rate > 0 and ap == ap:
+        ax.annotate(f"AP is {ap / base_rate:.0f}x chance",
+                    xy=(0.62, base_rate), xytext=(0.52, base_rate + 0.14),
+                    fontsize=9, color="#5b6b7c",
+                    arrowprops=dict(arrowstyle="->", color="#7f8c8d", lw=1.2))
     ax.set_xlabel("recall"); ax.set_ylabel("precision")
     ax.set_xlim(0, 1.0); ax.set_ylim(0, 1.05)
     ax.set_title(f"PR curve  (AP={ap:.3f})")

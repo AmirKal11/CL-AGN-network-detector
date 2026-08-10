@@ -12,24 +12,154 @@ MaskedSpectraAutoencoder  Stage 1: encoder + decoder, trained by masked
 SiameseChangeNet          Stage 2: shared encoder + symmetric change head,
                           trained on real same-object epoch pairs.
 
-The proven multi-scale conv block (SpectraBlock), the attention stage
-(TransformerStage) and the focal loss are imported from the existing
-architectures.py so no tested code is re-derived. The only structural change
-to the backbone is the first conv: 2 input channels instead of 1.
+The multi-scale conv block (SpectraBlock), positional encoding
+(PositionalEncoding1D), and the attention stage (TransformerStage) are
+defined directly in this module so it has no dependency on architectures.py.
 
 Input convention everywhere: x has shape [B, 2, 4096]
-    channel 0 = MAD-normalised flux (full continuum retained, v2)
-    channel 1 = [OIII]-normalised flux
+    channel 0 = MAD-normalised flux (continuum-subtracted)
+    channel 1 = [OIII]-normalised flux (raw physical flux / OIII anchor)
 Out-of-coverage pixels are 0.0 in both channels (see preprocessing_oiii.py).
 """
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from architectures import SpectraBlock, TransformerStage, BinaryFocalLossWithLogits
+
+# ---------------------------------------------------------------------------
+# Building blocks (inlined from architectures.py so this module is self-contained)
+# ---------------------------------------------------------------------------
+
+class PositionalEncoding1D(nn.Module):
+    def __init__(self, channels, max_len=1024):
+        super(PositionalEncoding1D, self).__init__()
+        pe = torch.zeros(max_len, channels)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, channels, 2).float() * (-math.log(10000.0) / channels))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # [1, max_len, channels]
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: [Batch, Sequence, Channels]
+        seq_len = x.size(1)
+        x = x + self.pe[:, :seq_len, :]
+        return x
+
+
+class SpectraBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_sizes, apply_pool=True):
+        super().__init__()
+        k1, k2, k3 = kernel_sizes
+        self.branch1 = nn.Conv1d(in_channels, out_channels, kernel_size=k1, padding=k1 // 2)
+        self.branch2 = nn.Conv1d(in_channels, out_channels, kernel_size=k2, padding=k2 // 2)
+        # Dilated branch to catch broad (1+z) stretched wings
+        self.branch3 = nn.Conv1d(in_channels, out_channels, kernel_size=k3,
+                                 padding=(k3 - 1) // 2 * 2, dilation=2)
+        self.fusion = nn.Conv1d(out_channels * 3, out_channels, kernel_size=1)
+        self.norm = nn.GroupNorm(1, out_channels)
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.GroupNorm(1, out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+        self.gelu = nn.GELU()
+        self.dropout = nn.Dropout1d(0.15)
+        self.pool = nn.MaxPool1d(2) if apply_pool else nn.Identity()
+
+    def forward(self, x):
+        x1 = self.branch1(x)
+        x2 = self.branch2(x)
+        x3 = self.branch3(x)
+        out = torch.cat([x1, x2, x3], dim=1)
+        out = self.fusion(out)
+        out = self.norm(out)
+        res = self.shortcut(x)
+        out = out + res
+        out = self.gelu(out)
+        out = self.pool(out)
+        return out
+
+
+class TransformerStage(nn.Module):
+    def __init__(self, embed_dim, num_heads=8):
+        super().__init__()
+        self.pos_encoder = PositionalEncoding1D(channels=embed_dim)
+        self.mha = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=0.2)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        # x: [Batch, Sequence, Channels]
+        x = self.pos_encoder(x)
+        attn_output, attn_weights = self.mha(x, x, x)
+        x = self.norm1(x + attn_output)
+        ffn_output = self.ffn(x)
+        x = self.norm2(x + ffn_output)
+        return x, attn_weights
+
+
+class BinaryFocalLossWithLogits(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        """
+        Binary Focal Loss for imbalanced datasets.
+
+        Args:
+            alpha (float): Weighting factor for the positive class (0 to 1).
+                           If alpha=0.25, positive class gets 0.25 weight, negative gets 0.75.
+                           Set to ~ (num_negatives / total_samples) for your dataset.
+            gamma (float): Focusing parameter. Higher values strongly down-weight easy examples.
+            reduction (str): 'none', 'mean', or 'sum'.
+        """
+        super(BinaryFocalLossWithLogits, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # 1. Compute standard BCE loss using logits for stability
+        # We use reduction='none' so we can apply the focal weight element-wise
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+
+        # 2. Convert logits to probabilities
+        p = torch.sigmoid(inputs)
+
+        # 3. Calculate the probability of the *true* class (p_t)
+        # If target is 1, p_t is p. If target is 0, p_t is (1 - p).
+        p_t = p * targets + (1 - p) * (1 - targets)
+
+        # 4. Calculate the modulating factor: (1 - p_t)^gamma
+        modulating_factor = (1.0 - p_t) ** self.gamma
+
+        # 5. Apply the alpha weighting
+        # If target is 1, use alpha. If target is 0, use (1 - alpha).
+        alpha_factor = targets * self.alpha + (1 - targets) * (1.0 - self.alpha)
+
+        # 6. Combine all pieces
+        focal_loss = alpha_factor * modulating_factor * bce_loss
+
+        # 7. Apply reduction
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
 __all__ = [
     "SpectraEncoder",

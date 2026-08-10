@@ -32,7 +32,7 @@ In ML terms, this is a rare-event binary change-detection system trained on pair
 | **Recall** at operating threshold | **88.6%** (31 / 35 confirmed CL-AGN) |
 | **FPR** at operating threshold | **2.4%** (17 / 700 non-CL-AGN flagged) |
 
-The best model checkpoint was selected by **validation PR-AUC**. The operating threshold (0.547) was then chosen on that checkpoint's validation outputs by maximising **F₂** subject to FPR ≤ 5%, and applied to the held-out test set without modification. This operating point prioritises recovering likely CL-AGN candidates while keeping the false-positive rate low enough for manual follow-up.
+The best model checkpoint was selected by **validation PR-AUC**. The operating threshold (0.547) was then chosen on that checkpoint's validation outputs as the **maximum-recall threshold subject to FPR ≤ 5%**, and applied to the held-out test set without modification. This operating point prioritises recovering likely CL-AGN candidates while keeping the false-positive rate low enough for manual follow-up.
 
 <p align="center">
   <img src="models/continuum_subtracted_full_dr7/eval_clagn_test.png" alt="PR curve and confusion matrix — fixed OIII model" width="800"/>
@@ -121,7 +121,7 @@ Each spectrum pair is converted to a **2-channel, 4096-pixel rest-frame array** 
 
 Both channels are arcsinh-compressed to handle the dynamic range of emission-line spikes.
 
-The **Siamese head** is trained with **binary focal loss** (α = 0.5, γ = 2) to down-weight the large number of easy negatives in the heavily imbalanced dataset (≈ 1:7 positive ratio after oversampling). The batch sampler targets **30% positives per batch** (oversampled), and the AdamW head learning rate is 1 × 10⁻³ over 40 epochs with cosine annealing. The encoder is frozen throughout Stage 2, so only the ≈ 500k-parameter MLP head is updated. Checkpoint selection uses the **mean per-survey PR-AUC** (each survey weighted equally). The operating threshold is then chosen on the validation set by maximising **F₂** subject to FPR ≤ 5% — weighting recall twice as heavily as precision to match the deployment goal of surfacing a short candidate list for human inspection.
+The **Siamese head** is trained with **binary focal loss** (α = 0.5, γ = 2) to down-weight the large number of easy negatives in the heavily imbalanced dataset (≈ 1:7 positive ratio after oversampling). The batch sampler targets **30% positives per batch** (oversampled), and the AdamW head learning rate is 1 × 10⁻³ over 40 epochs with cosine annealing. The encoder is frozen throughout Stage 2, so only the ≈ 500k-parameter MLP head is updated. Checkpoint selection uses the **mean per-survey PR-AUC** (each survey weighted equally). The operating threshold is then chosen on the validation set (SDSS-V subset) as the threshold giving **maximum recall subject to FPR ≤ 5%** — recall is maximised while the false-positive rate is merely capped at the inspection budget, matching the deployment goal of surfacing a short candidate list for human inspection. An F₂ sweep (`_threshold_sweep`, recall weighted twice as heavily as precision) is also implemented, but it is used only as a diagnostic in `eval_clagn_test.py`; it does not set the deployed threshold.
 
 
 
@@ -143,27 +143,97 @@ The SSL pool is dominated by SDSS DR7 (~58% of spectra), so the encoder is bette
 
 Checkpoint selection used the SDSS-V + DR16 validation loss (green) rather than the global loss as the selection criterion — this is a more honest signal for how the encoder will generalise to the surveys most relevant to the Siamese head.
 
+Notably, the loss gap between SDSS surveys (DR16 and SDSS-V) and other surveys persists even when training exclusively on SDSS data — **the SDSS-only validation loss converges to the same elevated values seen in the mixed-survey run**. This confirms the gap is intrinsic to the noisier SDSS calibration rather than a consequence of DR7 dominance in the training pool. The SSL reconstruction below illustrates this: the encoder reconstructs the broad spectral shape and emission line positions faithfully, but SDSS spectra carry more per-pixel noise that the autoencoder cannot (and should not) reproduce.
+
+<p align="center">
+  <img src="models/continuum_subtracted_full_dr7/ssl_reconstruction_ch1.png" alt="SSL reconstruction — channel 1 (OIII-anchored)" width="700"/>
+</p>
+
 Two strategies were tested to directly address the DR7 dominance:
 
 **Capping DR7 at 24k spectra.** Reducing DR7's share of the SSL pool hurt performance — the encoder benefits from the volume of DR7 data even at the cost of some survey bias, likely because the additional spectra improve the quality of learned spectral representations overall.
 
-**Survey-weighted SSL loss (SDSS-V and DR16 upweighted 3×).** Rather than removing DR7 data, this run kept the full pool but gave SDSS-V and DR16 spectra 3× more gradient signal during pretraining. PR-AUC improved marginally (0.832 → 0.842), confirming the ranking quality was at least maintained. However, recall at the operating threshold dropped significantly (88.6% → 62.9%), with FPR falling to 0.4%. This suggests the weighting shifted the score distribution — the val-derived threshold no longer matched the test set — rather than producing a genuinely better model. The unweighted run remains the best overall result.
+**Survey-weighted SSL loss per z bin.** Rather than removing DR7 data, this run kept the full pool but divided the data into bins based on redshift and equalised the number of spectra per survey per redshift bin. On the held-out test set, PR-AUC improved (0.832 → 0.875) and the false positive rate on SDSS-V negatives dropped to 0.25% (1/400), compared to 1.5% (6/400) for the baseline model. However, test set statistics for SDSS positive pairs are very limited (35 total), making these numbers unreliable on their own.
 
-The DR7 bias is therefore acknowledged but accepted as a current limitation.
+To get a more robust comparison, both models were run on real, unlabelled SDSS data (SDSS-V vs DR16 pairs) and the score distributions were decomposed with a two-component Gaussian mixture model (logit-space EM). The "stable" component captures the majority of non-changing objects; the "changed" component captures candidate CL-AGN transitions:
+
+<p align="center">
+  <img src="models/continuum_subtracted_full_dr7/mixture_fit_test_data.png" alt="Two-component mixture — baseline model (13% changed)" width="650"/>
+</p>
+<p align="center"><em>Baseline model: 13% "changed" (p ≈ 0.73), clean bimodal separation, crossover at p = 0.59.</em></p>
+
+<p align="center">
+  <img src="models/weighted_loss_per_Z/mixture_fit.png" alt="Two-component mixture — per-z-bin weighted model (42% changed)" width="650"/>
+</p>
+<p align="center"><em>Per-z-bin weighted model: 42% "changed" (p ≈ 0.50), broad flat component spanning the full probability range, crossover at p = 0.04.</em></p>
+
+The per-z-bin model produces a diffuse, nearly uniform "changed" component centred at p ≈ 0.50 — assigning middling scores to a large fraction of the population rather than committing to high-confidence detections. 42% "changed" is physically implausible given expected CL-AGN rates of a few percent. By contrast, the baseline model's "changed" component is sharply localised at p ≈ 0.73 with a natural decision boundary at p = 0.59, and 13% — while still an upper bound — is in a plausible regime. The per-z-bin weighting improved test-set metrics but degraded the model's ability to produce separable, well-calibrated scores on real unlabelled data. The baseline model is therefore preferred for SDSS deployment.
 
 ---
 
-### Ablation: preprocessing choices
+### Ablation summary — all runs
 
-**Continuum subtraction in ch0.** Two runs were compared — identical architecture, data, and hyperparameters, differing only in whether the smooth continuum was subtracted from ch0 before MAD normalisation:
+Every model trained for this project, evaluated on the same held-out test set
+(735 pairs: 35 positive, 700 negative) at each run's own saved threshold. The
+three varied factors are the ch0 representation, the size of the Stage-1 SSL
+pool, and whether the SSL reconstruction loss was reweighted across surveys.
+All runs share the architecture, the Stage-2 pair set, and the selection rules
+(checkpoint = mean per-survey PR-AUC; threshold = max recall at FPR ≤ 5% on the
+SDSS-V validation subset).
+
+| Run | ch0 | SSL pool | SSL loss weighting | Recall | FPR | PR-AUC | ROC-AUC | FPR on SDSS-V neg |
+|---|---|---|---|---|---|---|---|---|
+| **`continuum_subtracted_full_dr7`** — deployed | continuum-subtracted | 82,006 | none | **88.6%** (31/35) | 2.4% (17/700) | 0.832 | 0.984 | 1.5% (6/400) |
+| `weighted_loss_per_Z` | continuum-subtracted | 82,006 | per-z-bin, DR7→SDSS-V parity | 71.4% (25/35) | **0.3%** (2/700) | **0.875** | **0.988** | **0.25%** (1/400) |
+| `sdssv_weighted` | continuum-subtracted | 82,006 | SDSS-V/DR16 ×3 | 62.9% (22/35) | 0.4% (3/700) | 0.842 | 0.975 | 0.75% (3/400) |
+| `raw_continuum_dr7_capped` | raw flux + MAD | 58,424 (DR7 capped) | none | 80.0% (28/35) | 2.6% (18/700) | 0.812 | 0.983 | 2.5% (10/400) |
+| `raw_continuum_full_dr7` | raw flux + MAD | 82,006 | none | 77.1% (27/35) | 2.4% (17/700) | 0.790 | 0.977 | 2.25% (9/400) |
+
+Metrics are read directly from each directory's `eval_clagn_test.json`. Model
+provenance, including two directory renames, is documented in
+[`docs/MODELS.md`](docs/MODELS.md).
+
+**The deployed model has neither the best PR-AUC nor the lowest FPR, and that is
+the intended outcome.** Selection is recall-first under an inspection budget:
+the objective is to surface as many genuine transitions as possible while
+holding the false-positive rate below what human follow-up can absorb, not to
+maximise a threshold-free ranking score. `weighted_loss_per_Z` wins on PR-AUC
+(0.875) and FPR (0.3%) but misses 10 of 35 real transitions against the
+deployed model's 4 — a trade that only looks favourable if the cost of a missed
+CL-AGN is comparable to the cost of an unnecessary inspection, which it is not.
+The reason it was rejected on evidence beyond the test set — a 42% "changed"
+fraction under the two-component mixture fit, physically implausible against
+expected CL-AGN rates — is described in [SSL encoder bias](#ssl-encoder-bias)
+above.
+
+**Continuum subtraction in ch0 — the single largest preprocessing effect.** The
+top and bottom rows isolate it cleanly: both used the identical 82,006-spectrum
+SSL pool and the same calibrated `channel1_scale` (0.007765), differing only in
+whether the slowly-varying continuum was removed from ch0 before MAD
+normalisation.
 
 | Configuration | Recall | FPR | PR-AUC |
 |---|---|---|---|
 | Continuum subtracted + MAD (full DR7) | **88.6%** (31/35) | 2.4% | **0.832** |
-| Raw flux + MAD only (full DR7) | 80.0% (28/35) | 2.6% | 0.812 |
-| Continuum subtracted + SDSS-V/DR16 weighted SSL loss (full DR7) | 62.9% (22/35) | 0.4% | 0.842 |
+| Raw flux + MAD only (full DR7) | 77.1% (27/35) | 2.4% | 0.790 |
 
-Continuum subtraction isolates emission line shapes from the slowly-varying flux baseline, giving the encoder a cleaner signal to reconstruct and the Siamese head a sharper change feature to detect. The 8-point recall difference confirms it is a meaningful preprocessing choice for this task. 
+Continuum subtraction isolates emission line shapes from the slowly-varying
+flux baseline, giving the encoder a cleaner signal to reconstruct and the
+Siamese head a sharper change feature to detect. At matched FPR it is worth
+**11.4 recall points** and 0.042 PR-AUC — the largest single gain from any
+preprocessing choice tested.
+
+> The `raw_continuum_dr7_capped` row is *not* the right comparison for this
+> question: it differs from the deployed model in two factors at once (raw ch0
+> **and** a DR7-capped SSL pool), so it cannot attribute the gap to either one.
+
+**Survey reweighting of the SSL loss consistently trades recall for purity.**
+Both reweighted runs drive the false-positive rate down hard — `weighted_loss_per_Z`
+reaches 0.25% on SDSS-V negatives against the deployed model's 1.5% — but each
+costs 17–26 points of recall. Reducing DR7's effective share of the
+reconstruction objective evidently removes representational capacity that the
+change head depends on, even though it narrows the domain gap it was intended
+to close. Neither variant was adopted.
 
 
 
@@ -236,12 +306,6 @@ python src/gradcam_pairs.py --config config_v2.yml   # interpretability plots
 ---
 
 ## Example outputs
-
-**SSL reconstruction (Stage 1).** The masked autoencoder learns to reconstruct randomly-masked spans — shown here for both input channels (MAD-normalised flux and OIII-anchored amplitude):
-
-<p align="center">
-  <img src="models/continuum_subtracted_full_dr7/ssl_reconstruction_ch1.png" alt="SSL reconstruction — channel 1 (OIII-anchored)" width="700"/>
-</p>
 
 **Input-gradient interpretability.** Each spectrum is coloured by the signed gradient of the CL-AGN logit with respect to the flux at that wavelength. Red regions pushed the prediction toward CL-AGN; blue pushed against it. Example true positive and false positive — in the FP case the model focuses on Hα at the red edge, where coverage drops and broad-wing structure is hard to rule out:
 

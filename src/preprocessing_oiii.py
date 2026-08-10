@@ -252,68 +252,6 @@ def measure_oiii_flux(spec: np.ndarray, wave: np.ndarray = MASTER_GRID,
     return flux, snr
 
 
-# ----------------------------------------------------------------------
-# Two-channel builder
-# ----------------------------------------------------------------------
-def build_two_channel(
-    madnorm: np.ndarray,
-    wave: np.ndarray = MASTER_GRID,
-    channel1_scale: float = 1.0,
-    oiii_snr_min: float = 4.0,
-    valid: np.ndarray | None = None,
-):
-    """
-    Build the [MAD-norm, OIII-norm] 2-channel input from a MAD-normalised
-    continuum-subtracted spectrum.
-
-    channel1_scale puts channel 1 on roughly the same magnitude as channel 0.
-    Use estimate_channel1_scale(...) once on the pre-training set and reuse the
-    saved value everywhere (see save_norm_stats / load_norm_stats).
-
-    If [OIII] is too weak/noisy to anchor on, channel 1 falls back to channel 0
-    (a benign "no extra information" state) and oiii_reliable is False.
-
-    Returns
-    -------
-    x    : np.ndarray  float32, shape [2, L]
-    info : dict        {oiii_flux, oiii_snr, oiii_reliable}
-    """
-    madnorm = np.asarray(madnorm, dtype=np.float32)
-    ch0 = madnorm
-
-    flux, snr = measure_oiii_flux(madnorm, wave, valid=valid)
-    reliable = bool(snr >= oiii_snr_min and flux > 1e-6)
-
-    if reliable:
-        ch1 = (madnorm / flux) / float(channel1_scale)
-    else:
-        ch1 = madnorm.copy()  # graceful fallback -> channel 1 == channel 0
-
-    # arcsinh-compress: tames the heavy dynamic-range tail (line peaks, and the
-    # [OIII]-divided channel for weak-[OIII] objects) while preserving sign and
-    # relative amplitude, so the reconstruction loss stays well-conditioned.
-    x = np.arcsinh(np.stack([ch0, ch1], axis=0)).astype(np.float32)
-    info = {
-        "oiii_flux": float(flux),
-        "oiii_snr": float(snr),
-        "oiii_reliable": reliable,
-    }
-    return x, info
-
-
-def flat_to_two_channel(
-    flat: np.ndarray,
-    wave: np.ndarray = MASTER_GRID,
-    channel1_scale: float = 1.0,
-    oiii_snr_min: float = 4.0,
-    taper_len: int = 5,
-    valid: np.ndarray | None = None,
-):
-    """Convenience: continuum-subtracted flat -> MAD-normalise -> 2-channel."""
-    madnorm, _ = mad_normalize(flat, valid=valid, taper_len=taper_len)
-    return build_two_channel(madnorm, wave, channel1_scale, oiii_snr_min,
-                             valid=valid)
-
 
 # ----------------------------------------------------------------------
 # Channel-1 scale calibration

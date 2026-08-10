@@ -164,6 +164,7 @@ def _threshold_sweep(probs: np.ndarray,
                      thresholds: np.ndarray | None = None):
     """
     Ported from train_siamese.py / evaluate_siamese_threshold_sweep.
+    Currently not being used
 
     For each threshold in [0.05, 0.95] (19 steps by default), compute
     precision, recall, F-beta, FPR, and the confusion matrix on the
@@ -342,11 +343,12 @@ def main():
     # Initialise the head bias with the observed positive rate so the model
     # starts calibrated under heavy class imbalance.
     train_pos_rate = float((arrays["y"][train_idx] == 1).mean())
+    prior_pos = s["sampler_pos_rate"] if s.get("sampler_pos_rate", 0.0) > 0.0 else max(train_pos_rate, 0.01)
     print(f"[siamese] train positive rate (real only) = {train_pos_rate:.3f}")
     model = SiameseChangeNet(
         in_channels=2,
         dropout=s["dropout"],
-        prior_pos=max(train_pos_rate, 0.01),
+        prior_pos=prior_pos,
     )
     ssl_ckpt = os.path.join(BASE_DIR, paths["ssl_checkpoint"])
     if not os.path.exists(ssl_ckpt):
@@ -391,9 +393,9 @@ def main():
     # Candidate ranker: CHECKPOINT is selected on the MEAN of per-survey PR-AUC
     # (each survey weighted equally so the larger DESI count can't drown SDSS-V),
     # and the saved deployment threshold is max recall at FPR<=max_fpr on SDSS-V.
-    fbeta_beta = float(s.get("fbeta_beta", 2.0))   # kept in ckpt metadata only
-    min_recall = float(s.get("min_recall", 0.10))  # informational
-    max_fpr    = float(s.get("max_fpr", 0.05))     # B/N inspection-budget ceiling
+    # fbeta_beta = float(s.get("fbeta_beta", 2.0))   # kept in ckpt metadata only
+    # min_recall = float(s.get("min_recall", 0.10))  # informational
+    max_fpr = float(s.get("max_fpr", 0.05))     # B/N inspection-budget ceiling
 
     val_survey = np.asarray(arrays["survey"][val_idx]) if "survey" in arrays else None
     y_val = arrays["y"][val_idx]

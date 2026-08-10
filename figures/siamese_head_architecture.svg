@@ -1,0 +1,162 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 840" font-family="Arial, Helvetica, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#475569"/>
+    </marker>
+    <marker id="arrv" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#7c3aed"/>
+    </marker>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="1000" height="840" fill="#ffffff"/>
+
+  <!-- title -->
+  <text x="500" y="34" text-anchor="middle" font-size="20" font-weight="bold" fill="#0f172a">SiameseChangeNet — Layer-by-layer architecture</text>
+  <text x="500" y="54" text-anchor="middle" font-size="12" fill="#64748b">Input: two spectra [B, 2, 4096] each  →  Output: [B, 1] logit  →  P(change)</text>
+
+  <!-- ===== INPUTS ===== -->
+  <rect x="20" y="96" width="104" height="64" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="72" y="120" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e293b">Epoch A</text>
+  <text x="72" y="138" text-anchor="middle" font-size="10" fill="#475569">x₁ [B, 2, 4096]</text>
+
+  <rect x="20" y="286" width="104" height="64" rx="8" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="72" y="310" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e293b">Epoch B</text>
+  <text x="72" y="328" text-anchor="middle" font-size="10" fill="#475569">x₂ [B, 2, 4096]</text>
+
+  <line x1="124" y1="128" x2="144" y2="128" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+  <line x1="124" y1="318" x2="144" y2="318" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <!-- ===== SHARED ENCODER (two instances, one set of weights) ===== -->
+  <rect x="146" y="88" width="150" height="80" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text x="221" y="112" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e3a8a">SpectraEncoder</text>
+  <text x="221" y="130" text-anchor="middle" font-size="10" fill="#3b82f6">CNN + transformer</text>
+  <text x="221" y="150" text-anchor="middle" font-size="10" font-weight="bold" fill="#1d4ed8">→ [B, 512]</text>
+
+  <rect x="146" y="278" width="150" height="80" rx="10" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text x="221" y="302" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e3a8a">SpectraEncoder</text>
+  <text x="221" y="320" text-anchor="middle" font-size="10" fill="#3b82f6">CNN + transformer</text>
+  <text x="221" y="340" text-anchor="middle" font-size="10" font-weight="bold" fill="#1d4ed8">→ [B, 512]</text>
+
+  <!-- shared-weights link -->
+  <line x1="221" y1="168" x2="221" y2="278" stroke="#2563eb" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <rect x="150" y="198" width="142" height="50" rx="6" fill="#ffffff" stroke="#93c5fd"/>
+  <text x="221" y="217" text-anchor="middle" font-size="10" font-weight="bold" fill="#1e3a8a">same instance</text>
+  <text x="221" y="232" text-anchor="middle" font-size="9" fill="#3b82f6">weights shared &#183; frozen</text>
+  <text x="221" y="244" text-anchor="middle" font-size="9" fill="#3b82f6">throughout Phase 2</text>
+
+  <!-- ===== EMBEDDINGS ===== -->
+  <rect x="316" y="104" width="86" height="48" rx="7" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="359" y="124" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e3a8a">e₁</text>
+  <text x="359" y="141" text-anchor="middle" font-size="10" fill="#1e3a8a">[B, 512]</text>
+
+  <rect x="316" y="294" width="86" height="48" rx="7" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="359" y="314" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e3a8a">e₂</text>
+  <text x="359" y="331" text-anchor="middle" font-size="10" fill="#1e3a8a">[B, 512]</text>
+
+  <line x1="296" y1="128" x2="314" y2="128" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+  <line x1="296" y1="318" x2="314" y2="318" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <!-- ===== SYMMETRIC FUSION ===== -->
+  <rect x="424" y="80" width="196" height="300" rx="10" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="522" y="102" text-anchor="middle" font-size="12" font-weight="bold" fill="#065f46">Symmetric fusion</text>
+  <text x="522" y="117" text-anchor="middle" font-size="10" fill="#059669">element-wise, order-invariant</text>
+
+  <rect x="436" y="130" width="172" height="54" rx="6" fill="#d1fae5" stroke="#059669"/>
+  <text x="522" y="152" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46">e₁ + e₂</text>
+  <text x="522" y="170" text-anchor="middle" font-size="9" fill="#047857">shared context &#183; [B, 512]</text>
+
+  <rect x="436" y="194" width="172" height="54" rx="6" fill="#d1fae5" stroke="#059669"/>
+  <text x="522" y="216" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46">| e₁ − e₂ |</text>
+  <text x="522" y="234" text-anchor="middle" font-size="9" fill="#047857">size of the change &#183; [B, 512]</text>
+
+  <rect x="436" y="258" width="172" height="54" rx="6" fill="#d1fae5" stroke="#059669"/>
+  <text x="522" y="280" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46">e₁ × e₂</text>
+  <text x="522" y="298" text-anchor="middle" font-size="9" fill="#047857">element-wise product &#183; [B, 512]</text>
+
+  <text x="522" y="336" text-anchor="middle" font-size="10" fill="#065f46">all three are unchanged if the two</text>
+  <text x="522" y="350" text-anchor="middle" font-size="10" fill="#065f46">epochs are swapped</text>
+
+  <line x1="404" y1="128" x2="422" y2="150" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+  <line x1="404" y1="318" x2="422" y2="296" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <!-- ===== CONCAT ===== -->
+  <rect x="652" y="196" width="112" height="68" rx="8" fill="#f8fafc" stroke="#475569" stroke-width="1.8"/>
+  <text x="708" y="222" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e293b">concat</text>
+  <text x="708" y="242" text-anchor="middle" font-size="11" font-weight="bold" fill="#7c3aed">[B, 1536]</text>
+  <text x="708" y="256" text-anchor="middle" font-size="9" fill="#64748b">3 × 512</text>
+
+  <line x1="622" y1="230" x2="650" y2="230" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <!-- concat -> MLP row -->
+  <path d="M766,230 L830,230 L830,410 L108,410 L108,452" fill="none" stroke="#7c3aed" stroke-width="1.8" marker-end="url(#arrv)"/>
+  <text x="470" y="402" text-anchor="middle" font-size="10" fill="#7c3aed">change head — the only trained parameters in Phase 2</text>
+
+  <!-- ===== MLP HEAD ROW ===== -->
+  <rect x="40" y="456" width="136" height="76" rx="8" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.8"/>
+  <text x="108" y="484" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">Linear</text>
+  <text x="108" y="501" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">1536 → 512</text>
+  <text x="108" y="519" text-anchor="middle" font-size="9" fill="#6d28d9">787k params</text>
+  <text x="108" y="552" text-anchor="middle" font-size="10" font-weight="bold" fill="#6d28d9">[B, 512]</text>
+
+  <line x1="176" y1="494" x2="194" y2="494" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <rect x="196" y="456" width="136" height="76" rx="8" fill="#faf5ff" stroke="#a78bfa" stroke-width="1.8"/>
+  <text x="264" y="484" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">GELU</text>
+  <text x="264" y="501" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">Dropout</text>
+  <text x="264" y="519" text-anchor="middle" font-size="9" fill="#6d28d9">p = 0.40</text>
+  <text x="264" y="552" text-anchor="middle" font-size="10" font-weight="bold" fill="#6d28d9">[B, 512]</text>
+
+  <line x1="332" y1="494" x2="350" y2="494" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <rect x="352" y="456" width="136" height="76" rx="8" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.8"/>
+  <text x="420" y="484" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">Linear</text>
+  <text x="420" y="501" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">512 → 128</text>
+  <text x="420" y="519" text-anchor="middle" font-size="9" fill="#6d28d9">66k params</text>
+  <text x="420" y="552" text-anchor="middle" font-size="10" font-weight="bold" fill="#6d28d9">[B, 128]</text>
+
+  <line x1="488" y1="494" x2="506" y2="494" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <rect x="508" y="456" width="136" height="76" rx="8" fill="#faf5ff" stroke="#a78bfa" stroke-width="1.8"/>
+  <text x="576" y="484" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">GELU</text>
+  <text x="576" y="501" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">Dropout</text>
+  <text x="576" y="519" text-anchor="middle" font-size="9" fill="#6d28d9">p = 0.24</text>
+  <text x="576" y="552" text-anchor="middle" font-size="10" font-weight="bold" fill="#6d28d9">[B, 128]</text>
+
+  <line x1="644" y1="494" x2="662" y2="494" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <rect x="664" y="456" width="136" height="76" rx="8" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.8"/>
+  <text x="732" y="484" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">Linear</text>
+  <text x="732" y="501" text-anchor="middle" font-size="11" font-weight="bold" fill="#4c1d95">128 → 1</text>
+  <text x="732" y="519" text-anchor="middle" font-size="9" fill="#6d28d9">bias ← log-odds(pos rate)</text>
+  <text x="732" y="552" text-anchor="middle" font-size="10" font-weight="bold" fill="#6d28d9">[B, 1] logit</text>
+
+  <line x1="800" y1="494" x2="818" y2="494" stroke="#475569" stroke-width="1.8" marker-end="url(#arr)"/>
+
+  <rect x="820" y="456" width="140" height="76" rx="8" fill="#ecfdf5" stroke="#059669" stroke-width="2"/>
+  <text x="890" y="486" text-anchor="middle" font-size="13" font-weight="bold" fill="#065f46">σ (sigmoid)</text>
+  <text x="890" y="508" text-anchor="middle" font-size="11" font-weight="bold" fill="#047857">P(change)</text>
+  <text x="890" y="552" text-anchor="middle" font-size="10" font-weight="bold" fill="#047857">[B, 1] in [0, 1]</text>
+
+  <!-- ===== NOTES ===== -->
+  <rect x="20" y="588" width="940" height="228" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="40" y="610" font-size="11" font-weight="bold" fill="#1e293b">Notes</text>
+
+  <rect x="40" y="620" width="10" height="10" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="58" y="630" font-size="10" fill="#334155">Both epochs go through the <tspan font-weight="bold">same encoder object</tspan> — one set of weights, applied twice. In Phase 2 those weights are frozen</text>
+  <text x="58" y="644" font-size="10" fill="#334155">(loaded from the masked-autoencoder pre-training), so gradients reach only the head.</text>
+
+  <rect x="40" y="656" width="10" height="10" fill="#d1fae5" stroke="#059669"/>
+  <text x="58" y="666" font-size="10" fill="#334155">Sum, absolute difference and element-wise product are all symmetric in (e₁, e₂). Swapping which epoch is "first" cannot</text>
+  <text x="58" y="680" font-size="10" fill="#334155">change the output, so the model cannot learn an epoch-order shortcut and no swap augmentation is needed.</text>
+
+  <rect x="40" y="692" width="10" height="10" fill="#f5f3ff" stroke="#7c3aed"/>
+  <text x="58" y="702" font-size="10" fill="#334155">The three branches carry complementary information: shared context (sum), how much changed (|difference|), and a</text>
+  <text x="58" y="716" font-size="10" fill="#334155">multiplicative interaction (product) that a plain difference cannot express.</text>
+
+  <text x="40" y="740" font-size="10" fill="#334155">The output bias is initialised to log(p / (1 − p)) with p = the observed positive rate, so training starts calibrated under the</text>
+  <text x="40" y="754" font-size="10" fill="#334155">~13% class imbalance instead of having to unlearn a 50/50 prior. Trained with binary focal loss (α = 0.5, γ = 2).</text>
+
+  <text x="40" y="778" font-size="10" fill="#334155">~853k head parameters (787k + 66k + 129). The frozen encoder adds ~1.81M that receive no gradient — a linear-probe</text>
+  <text x="40" y="792" font-size="10" fill="#334155">regime chosen because only 515 positive pairs are available for Phase 2.</text>
+</svg>

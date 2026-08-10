@@ -244,17 +244,98 @@ class SSLSpectraDataset(Dataset):
             print(f"[SSLSpectraDataset] [OIII] reliable: "
                   f"{reliable.sum():,}/{n:,}  channel1_scale={self.channel1_scale:.4g}")
 
+        # Per-sample SSL loss weights (survey × redshift-bin); see
+        # _build_sample_weights for the rationale.
+        self._build_sample_weights(verbose=verbose)
+
     def __len__(self):
         return len(self.flux)
 
-    # Survey loss weights: upweight deployment surveys (sdssv, dr16) relative to
-    # the large DR7/DESI pretraining pool to reduce the domain gap.
-    SURVEY_LOSS_WEIGHTS: dict[str, float] = {
-        "sdssv":    3.0,
-        "dr16":     3.0,
-        "sdss_dr7": 1.0,
-        "desi":     1.0,
-    }
+    # ------------------------------------------------------------------
+    # Per-sample SSL loss weights:  survey × redshift-bin downweighting
+    # ------------------------------------------------------------------
+    # The pretraining pool is dominated by low-z SDSS-DR7 (~48k of ~82k, piled
+    # up at z<0.2), so the encoder over-allocates capacity to DR7 and leaves a
+    # domain gap on the deployment surveys (SDSS-V + DR16): their masked-recon
+    # MSE plateaus ~0.35 vs ~0.27 for the DR7-heavy global val.
+    #
+    # Fix: balance the *effective* per-z-bin counts against the primary science
+    # survey, SDSS-V. SDSS-V (and DR16, which is never downweighted) stay at
+    # weight 1.0; majority surveys are DOWNweighted per Δz=0.1 bin toward parity
+    # with the SDSS-V density in that bin:
+    #
+    #     w(survey, bin) = clip( N_ref(bin) / N_survey(bin), W_FLOOR, 1.0 )
+    #
+    # N_ref uses REFERENCE_SURVEYS = SDSS-V only (the deployment target). DR16 is
+    # not in REFERENCE_SURVEYS nor DOWNWEIGHT_SURVEYS, so it defaults to 1.0.
+    # Using SDSS-V alone (smaller than SDSS-V+DR16) downweights DR7 harder.
+    #
+    # Downweighting (max weight 1.0) instead of upweighting the minority keeps
+    # gradient magnitudes bounded — numerically gentler than the old 3x upweight.
+    #
+    # Tunable knobs:
+    #   W_FLOOR        raise it if DR7 type-2 separability drops (the low-z DR7
+    #                  type-2 coverage gets the hardest downweight).
+    #   PROTECT_TYPE2  set True to pin every type-2 spectrum at weight 1.0,
+    #                  preserving the scarce DR7 low-z type-2 regardless of bin.
+    Z_BIN_WIDTH        = 0.1
+    Z_MAX              = 0.9
+    REFERENCE_SURVEYS  = ("sdssv",)            # parity target (held at weight 1.0)
+    DOWNWEIGHT_SURVEYS = ("sdss_dr7",)         # balanced toward the reference
+    WEIGHT_FLOOR       = 0.05                   # keep some signal from every bin
+    PROTECT_TYPE2      = False
+
+    def _build_sample_weights(self, verbose=True):
+        """Compute self.sample_weights[i] (float32) from (survey, z); see class doc."""
+        survey = self.meta["survey"].astype(str).to_numpy()
+        z = np.asarray(self.meta["z"].to_numpy(), dtype=float)
+        finite = np.isfinite(z)
+        nbins = int(np.ceil(self.Z_MAX / self.Z_BIN_WIDTH))
+        zc = np.clip(z, 0.0, self.Z_MAX - 1e-9)
+        zbin = np.where(finite, np.floor(zc / self.Z_BIN_WIDTH).astype(int), -1)
+
+        is_ref = np.isin(survey, np.asarray(self.REFERENCE_SURVEYS))
+        ref_counts = np.array(
+            [int(np.sum(is_ref & finite & (zbin == b))) for b in range(nbins)],
+            dtype=float,
+        )
+
+        weights = np.ones(len(survey), dtype=np.float32)
+        summary = {}
+        for s in self.DOWNWEIGHT_SURVEYS:
+            s_mask = (survey == s) & finite
+            wrow = []
+            for b in range(nbins):
+                cell = s_mask & (zbin == b)
+                n_s = int(cell.sum())
+                if n_s == 0:
+                    wrow.append(None)
+                    continue
+                w = float(np.clip(ref_counts[b] / n_s, self.WEIGHT_FLOOR, 1.0))
+                weights[cell] = w
+                wrow.append(w)
+            summary[s] = wrow
+
+        if self.PROTECT_TYPE2 and "agn_type" in self.meta.columns:
+            t2 = (self.meta["agn_type"].astype(str).str.lower()
+                  .str.contains("2").to_numpy())
+            weights[t2] = 1.0
+
+        # Unknown-z spectra (z NaN) are left at weight 1.0 (not downweighted).
+        self.sample_weights = weights
+
+        if verbose:
+            print(f"[SSLSpectraDataset] SSL loss weights "
+                  f"(survey x dz={self.Z_BIN_WIDTH}, floor={self.WEIGHT_FLOOR}, "
+                  f"protect_type2={self.PROTECT_TYPE2}):")
+            hdr = "  ".join(f"{b*self.Z_BIN_WIDTH:>4.1f}" for b in range(nbins))
+            print(f"    z-bin  : {hdr}")
+            print(f"    N_ref  : " + "  ".join(f"{int(c):>4d}" for c in ref_counts))
+            for s, wrow in summary.items():
+                wstr = "  ".join((f"{w:>4.2f}" if w is not None else "  --")
+                                 for w in wrow)
+                print(f"    {s:<7}: {wstr}")
+            print(f"    mean weight over pool = {float(weights.mean()):.3f}")
 
     def __getitem__(self, i):
         raw = self.flux[i]                           # raw physical flux from parquet
@@ -263,8 +344,7 @@ class SSLSpectraDataset(Dataset):
         madnorm, _ = mad_normalize(cs, valid=valid)  # MAD-normalised (ch0)
         x = _two_channel(raw, madnorm, self.oiii_flux[i],
                          bool(self.oiii_reliable[i]), self.channel1_scale)
-        survey = str(self.meta.iloc[i].get("survey", "")) if hasattr(self.meta.iloc[i], "get") else str(self.meta["survey"].iloc[i])
-        w = self.SURVEY_LOSS_WEIGHTS.get(survey, 1.0)
+        w = float(self.sample_weights[i])
         return torch.from_numpy(x), torch.from_numpy(valid), torch.tensor(w, dtype=torch.float32)
 
 
@@ -274,7 +354,10 @@ class SSLSpectraDataset(Dataset):
 # v4: spectra are split across data_v4/ (new) and data/ (existing). Resolve by
 # searching the given dir, then sibling dirs of spectra_dir, then project roots.
 _V4_ROOTS = [os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), d)
-             for d in ("data_v4", "data")]
+             for d in ("data_v4", "data",
+                       # downloaded crossmatch spectra live one level under data/;
+                       # _resolve only checks roots directly, so name this subdir.
+                       os.path.join("data", "sdssv_desi_crossmatch"))]
 
 
 def _resolve(spectra_dir, name):
@@ -282,24 +365,28 @@ def _resolve(spectra_dir, name):
     if os.path.isabs(p):
         return p
     cand = os.path.join(spectra_dir, p)
-    if os.path.exists(cand):
-        return cand
-    # Check sibling directories of spectra_dir (e.g. data/ when spectra_dir is data_v4/)
+    # Try each search dir with the name AS-STORED and with its bare basename.
+    # The pickle stores some names with a stale sub-path prefix (e.g.
+    # 'dr16_sdssv_crossmatch/spec-...fits') while the files now live as bare
+    # 'spec-...fits' under a different folder (data/sdssv_desi_crossmatch/), so
+    # the basename fallback is what actually finds them.
+    base = os.path.basename(p)
+    names = (p,) if base == p else (p, base)
+
+    # Search order: spectra_dir, its siblings, then the project-relative roots.
     parent = os.path.dirname(os.path.abspath(spectra_dir))
     try:
         siblings = [os.path.join(parent, d) for d in os.listdir(parent)
                     if os.path.isdir(os.path.join(parent, d))]
     except OSError:
         siblings = []
-    for sib in siblings:
-        c = os.path.join(sib, p)
-        if os.path.exists(c):
-            return c
-    # Project-relative fallback
-    for r in _V4_ROOTS:
-        c = os.path.join(r, p)
-        if os.path.exists(c):
-            return c
+    search_dirs = [spectra_dir] + siblings + list(_V4_ROOTS)
+
+    for d in search_dirs:
+        for nm in names:
+            c = os.path.join(d, nm)
+            if os.path.exists(c):
+                return c
     return cand
 
 
@@ -474,7 +561,7 @@ class RealPairDataset(Dataset):
     """
 
     def __init__(self, arrays, indices, channel1_scale, mode="train",
-                 synthetic_prob=0.35, seed=42):
+                 synthetic_prob=0.0, seed=42):
         if mode not in ("train", "val", "test"):
             raise ValueError(f"mode must be train/val/test, got {mode}")
         self.a = arrays

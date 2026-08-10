@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" font-family="Helvetica Neue, Helvetica, Arial, sans-serif">
+  <defs>
+    <style>
+      .card  { fill:#ffffff; stroke:#c3cedb; stroke-width:2; rx:12; }
+      .net   { fill:#f7f4ff; stroke:#8b73d6; stroke-width:2.5; rx:12; }
+      .key   { fill:#e9f7ef; stroke:#3f9e6b; stroke-width:2.5; rx:12; }
+      .title { font-size:32px; font-weight:700; fill:#1b2733; }
+      .sub   { font-size:18px; fill:#5b6b7c; font-style:italic; }
+      .ph    { font-size:21px; font-weight:700; fill:#1b2733; }
+      .b     { font-size:17px; fill:#33465a; }
+      .dot   { font-size:17px; fill:#2f6fb0; font-weight:700; }
+      .dotg  { font-size:17px; fill:#3f9e6b; font-weight:700; }
+      .em    { font-weight:700; fill:#1b2733; }
+      .foot  { font-size:17px; fill:#4a5a6a; }
+    </style>
+  </defs>
+
+  <text class="title" x="60" y="64">Phase 2 &#8212; training the Siamese change detector</text>
+  <text class="sub"   x="60" y="98">recall-first by design: the output is a ranked candidate list for human follow-up, not a final verdict</text>
+
+  <!-- ================= A : setup ================= -->
+  <rect class="card" x="60" y="140" width="720" height="290"/>
+  <text class="ph" x="90" y="184">Setup</text>
+
+  <text class="dot" x="90" y="228">&#8226;</text>
+  <text class="b"   x="114" y="228"><tspan class="em">Encoder frozen</tspan> (linear-probe regime) &#8212; only the change head is trained</text>
+  <text class="dot" x="90" y="264">&#8226;</text>
+  <text class="b"   x="114" y="264">Real same-object pairs only: <tspan class="em">3,969</tspan> train pairs, <tspan class="em">~13%</tspan> positive</text>
+  <text class="dot" x="90" y="300">&#8226;</text>
+  <text class="b"   x="114" y="300">Binary focal loss (&#945; 0.5, &#947; 2) &#183; AdamW + cosine &#183; head LR 1e-3 &#183; 40 epochs</text>
+  <text class="dot" x="90" y="336">&#8226;</text>
+  <text class="b"   x="114" y="336">Head bias initialised to the observed positive rate &#8594; calibrated at step 0</text>
+  <text class="dot" x="90" y="380">&#8226;</text>
+  <text class="b"   x="114" y="380">Why freeze: 515 positives cannot support fine-tuning the whole backbone</text>
+  <text class="b"   x="114" y="404">without re-learning survey-specific shortcuts</text>
+
+  <!-- ================= B : batches ================= -->
+  <rect class="card" x="820" y="140" width="720" height="290"/>
+  <text class="ph" x="850" y="184">Batch composition</text>
+
+  <text class="dot" x="850" y="228">&#8226;</text>
+  <text class="b"   x="874" y="228"><tspan class="em">WeightedRandomSampler</tspan> with replacement &#8594; <tspan class="em">~30%</tspan> positives per batch</text>
+  <text class="dot" x="850" y="264">&#8226;</text>
+  <text class="b"   x="874" y="264">Sampling probabilities, not loss weights: batches really do contain ~19/64</text>
+  <text class="b"   x="874" y="288">positive pairs, with positives repeated across the epoch</text>
+  <text class="dot" x="850" y="324">&#8226;</text>
+  <text class="b"   x="874" y="324">Positive mass split <tspan class="em">equally across surveys</tspan>: the 81 SDSS-V positives</text>
+  <text class="b"   x="874" y="348">get the same exposure as the 434 DESI ones</text>
+  <text class="dot" x="850" y="384">&#8226;</text>
+  <text class="b"   x="874" y="384">Epoch length = dataset size &#8212; no negative is discarded</text>
+
+  <!-- ================= C : selection ================= -->
+  <rect class="net" x="60" y="458" width="720" height="248"/>
+  <text class="ph" x="90" y="502">Checkpoint selection</text>
+
+  <text class="dot" x="90" y="546" fill="#8b73d6">&#8226;</text>
+  <text class="b"   x="114" y="546">Metric: <tspan class="em">mean per-survey PR-AUC</tspan> on validation</text>
+  <text class="dot" x="90" y="582" fill="#8b73d6">&#8226;</text>
+  <text class="b"   x="114" y="582">Each survey weighted equally, so the larger DESI arm cannot mask a</text>
+  <text class="b"   x="114" y="606">collapse on the science target (SDSS-V)</text>
+  <text class="dot" x="90" y="642" fill="#8b73d6">&#8226;</text>
+  <text class="b"   x="114" y="642">Not accuracy, not val loss: with a 13% positive rate both are dominated</text>
+  <text class="b"   x="114" y="666">by negatives, while PR-AUC measures the ranking we actually deploy</text>
+
+  <!-- ================= D : threshold ================= -->
+  <rect class="key" x="820" y="458" width="720" height="248"/>
+  <text class="ph" x="850" y="502">Operating threshold</text>
+
+  <text class="dotg" x="850" y="546">&#8226;</text>
+  <text class="b"    x="874" y="546">Rule: <tspan class="em">maximum recall subject to FPR &#8804; 5%</tspan>, measured on the SDSS-V</text>
+  <text class="b"    x="874" y="570">validation subset &#8212; recall is optimised, FPR is only <tspan class="em">capped</tspan></text>
+  <text class="dotg" x="850" y="606">&#8226;</text>
+  <text class="b"    x="874" y="606">The 5% cap is an <tspan class="em">inspection budget</tspan>: how many false candidates a human</text>
+  <text class="b"    x="874" y="630">is willing to vet per batch of spectra, not a statistical criterion</text>
+  <text class="dotg" x="850" y="666">&#8226;</text>
+  <text class="b"    x="874" y="666">F&#8322; sweep (recall weighted 2&#215; precision) logged alongside as a diagnostic</text>
+
+  <!-- ================= footer ================= -->
+  <rect class="card" x="60" y="734" width="1480" height="122"/>
+  <text class="ph"   x="90" y="776">Discipline</text>
+  <text class="foot" x="90" y="812">The threshold is fixed on <tspan class="em">validation</tspan> and applied to the held-out test <tspan class="em">unchanged</tspan> &#8212; it is never tuned on the test set. It is a</text>
+  <text class="foot" x="90" y="838">deployment parameter: on a new survey it is re-tuned to whatever inspection budget is available, without retraining the model.</text>
+</svg>

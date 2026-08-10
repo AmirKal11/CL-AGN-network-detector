@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" font-family="Helvetica Neue, Helvetica, Arial, sans-serif">
+  <defs>
+    <style>
+      .card { fill:#ffffff; stroke:#c3cedb; stroke-width:2; rx:12; }
+      .key  { fill:#f5f8fb; stroke:#c3cedb; stroke-width:2; rx:12; }
+      .title{ font-size:32px; font-weight:700; fill:#1b2733; }
+      .sub  { font-size:18px; fill:#5b6b7c; font-style:italic; }
+      .th   { font-size:15px; fill:#5b6b7c; font-weight:700; letter-spacing:0.6px; }
+      .tv   { font-size:19px; fill:#1b2733; font-weight:600; }
+      .ts   { font-size:14px; fill:#7a8794; }
+      .tn   { font-size:15px; fill:#5b6b7c; font-style:italic; }
+      .num  { font-size:22px; fill:#1b2733; font-weight:700; }
+      .ph   { font-size:19px; font-weight:700; fill:#1b2733; }
+      .b    { font-size:16px; fill:#33465a; }
+      .em   { font-weight:700; fill:#1b2733; }
+    </style>
+  </defs>
+
+  <text class="title" x="60" y="62">Ablation &#8212; what actually mattered</text>
+  <text class="sub"   x="60" y="94">same architecture, same pairs, same hyper-parameters; same held-out test (735 pairs, 35 positives). Only the marked component changes.</text>
+
+  <rect class="card" x="60" y="150" width="1480" height="448"/>
+  <text class="th" x="90" y="196">variant</text>
+  <text class="th" x="700" y="196" text-anchor="middle">recall</text>
+  <text class="th" x="900" y="196" text-anchor="middle">FPR</text>
+  <text class="th" x="1090" y="196" text-anchor="middle">PR-AUC</text>
+  <text class="th" x="1260" y="196">&#8195;</text>
+  <line x1="80" y1="212" x2="1520" y2="212" stroke="#c3cedb" stroke-width="2"/>
+  <rect x="80" y="230" width="1440" height="80" fill="#e9f7ef" stroke="#3f9e6b" stroke-width="2" rx="8"/>
+  <text class="tv" x="90" y="262">Detrended + robust-scaled ch0</text>
+  <text class="ts" x="90" y="286">full pre-training pool &#183; <tspan font-weight="700">deployed model</tspan></text>
+  <text class="num" x="700" y="266" text-anchor="middle">88.6%</text>
+  <text class="ts" x="700" y="288" text-anchor="middle">31/35</text>
+  <text class="num" x="900" y="266" text-anchor="middle">2.4%</text>
+  <text class="ts" x="900" y="288" text-anchor="middle">17/700</text>
+  <text class="num" x="1090" y="266" text-anchor="middle">0.832</text>
+  <text class="tn" x="1260" y="266">baseline</text>
+  <rect x="80" y="318" width="1440" height="80" fill="#f5f8fb" rx="8"/>
+  <text class="tv" x="90" y="350">Raw flux, robust scaling only</text>
+  <text class="ts" x="90" y="374">identical in every other respect</text>
+  <text class="num" x="700" y="354" text-anchor="middle">77.1%</text>
+  <text class="ts" x="700" y="376" text-anchor="middle">27/35</text>
+  <text class="num" x="900" y="354" text-anchor="middle">2.4%</text>
+  <text class="ts" x="900" y="376" text-anchor="middle">17/700</text>
+  <text class="num" x="1090" y="354" text-anchor="middle">0.790</text>
+  <text class="tn" x="1260" y="354">&#8722;11.4 recall pts</text>
+  <text class="tv" x="90" y="438">+ survey &#215; redshift-bin loss weights</text>
+  <text class="ts" x="90" y="462">re-balances the pre-training pool</text>
+  <text class="num" x="700" y="442" text-anchor="middle">71.4%</text>
+  <text class="ts" x="700" y="464" text-anchor="middle">25/35</text>
+  <text class="num" x="900" y="442" text-anchor="middle">0.3%</text>
+  <text class="ts" x="900" y="464" text-anchor="middle">2/700</text>
+  <text class="num" x="1090" y="442" text-anchor="middle">0.875</text>
+  <text class="tn" x="1260" y="442">best ranking</text>
+  <rect x="80" y="494" width="1440" height="80" fill="#f5f8fb" rx="8"/>
+  <text class="tv" x="90" y="526">+ 3&#215; weight on the two target surveys</text>
+  <text class="ts" x="90" y="550">cruder version of the same idea</text>
+  <text class="num" x="700" y="530" text-anchor="middle">62.9%</text>
+  <text class="ts" x="700" y="552" text-anchor="middle">22/35</text>
+  <text class="num" x="900" y="530" text-anchor="middle">0.4%</text>
+  <text class="ts" x="900" y="552" text-anchor="middle">3/700</text>
+  <text class="num" x="1090" y="530" text-anchor="middle">0.842</text>
+  <text class="tn" x="1260" y="530">most conservative</text>
+
+  <rect class="key" x="60" y="620" width="728" height="152"/>
+  <text class="ph" x="90" y="658">Reading the table</text>
+  <text class="b"  x="90" y="690"><tspan class="em">PR-AUC</tspan> is threshold-free &#8212; it measures the ranking.</text>
+  <text class="b"  x="90" y="716"><tspan class="em">Recall / FPR</tspan> are at each run&#8217;s own operating point, picked</text>
+  <text class="b"  x="90" y="742">on its validation set. Rows 3&#8211;4 rank better but sit at a much</text>
+  <text class="b"  x="90" y="768">more conservative threshold &#8212; not the same axis as row 1.</text>
+
+  <rect class="key" x="812" y="620" width="728" height="152"/>
+  <text class="ph" x="842" y="658">Two findings</text>
+  <text class="b"  x="842" y="690"><tspan class="em">1.</tspan> Removing the smooth baseline from ch0 is the single biggest</text>
+  <text class="b"  x="842" y="716">lever: <tspan class="em">+11.4 recall points, +0.042 PR-AUC</tspan>, nothing else changed.</text>
+  <text class="b"  x="842" y="742"><tspan class="em">2.</tspan> The best PR-AUC was <tspan class="em">not</tspan> deployed: row 3&#8217;s scores on real</text>
+  <text class="b"  x="842" y="768">unlabeled data were diffuse (42% flagged &#8220;changed&#8221; &#8212; implausible).</text>
+
+  <text class="sub" x="60" y="822">35 positives is a small denominator &#8212; one recovered object moves recall by 2.9 points. The ranking metric is the more stable comparison.</text>
+</svg>
